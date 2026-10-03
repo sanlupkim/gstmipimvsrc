@@ -14,6 +14,8 @@
 /* OpenCV's V4L2 backend will not go above this (MAX_V4L_BUFFERS in its cap_v4l.cpp; its own default
    is 4). Asking for more releases the buffers it had and then refuses, leaving capture dead. */
 #define OPENCV_MAX_V4L_BUFFERS 10
+
+#include "mvcam.h"
 using namespace cv;
 using namespace std;
 
@@ -99,6 +101,37 @@ typedef struct _GstMipiMvSrc {
     guint64 duration;
     guint64 frame_count;
 
+    /* ---- camera control over I2C ----
+       These cameras expose nothing through V4L2 controls: exposure, gain, frame rate, black level,
+       ROI and the sensor's own pixel format all live in an I2C register space. Driving it from here
+       means one pipeline description configures the camera as well, instead of needing set_params.sh
+       to have been run with matching values beforehand.
+
+       i2c_bus < 0 leaves the camera completely alone, which is the default. */
+    MvCam *i2c;
+    gint i2c_bus;
+    gint i2c_addr;
+    gboolean probe;
+
+    /* Only what nothing else owns. The veye_mvcam driver already drives the sensor's pixel format and
+       ROI from the media-ctl format, and its frame_rate / roi_x / roi_y controls work, so writing any
+       of those over I2C would desynchronise the driver's cached state from the hardware. Exposure and
+       gain are a different case: the driver's V4L2_CID_EXPOSURE and V4L2_CID_ANALOGUE_GAIN only store
+       the value ("just save the value" in its own comment) and never reach the camera, which is why
+       the vendor's set_params.sh writes them over I2C too.
+
+       -1 means leave alone. */
+    gdouble cam_fps;        /* -1 keep, 0 take it from the framerate property */
+    gint cam_exposure_us;
+    gdouble cam_gain_db;
+    gint cam_black_level;
+    gdouble cam_gamma;
+    gint cam_dpc;
+    gint cam_imgdir;
+    gint cam_testimg;
+    gint cam_auto_exposure;
+    gint cam_auto_gain;
+
 } GstMipiMvSrc;
 
 typedef struct _GstMipiMvSrcClass {
@@ -125,8 +158,26 @@ enum {
     PROP_OUT_FORMAT,
     PROP_STAMPS,
     PROP_BUFFERS,
-    PROP_THREADS
+    PROP_THREADS,
+    PROP_I2C_BUS,
+    PROP_I2C_ADDR,
+    PROP_PROBE,
+    PROP_CAM_FPS,
+    PROP_EXPOSURE,
+    PROP_GAIN,
+    PROP_CAM_BLACK_LEVEL,
+    PROP_CAM_GAMMA,
+    PROP_CAM_DPC,
+    PROP_CAM_IMGDIR,
+    PROP_CAM_TESTIMG,
+    PROP_CAM_AUTO_EXPOSURE,
+    PROP_CAM_AUTO_GAIN
 };
+
+/* Pushes one live control to the camera if the I2C side is up, so a property set while the pipeline
+   is already running takes effect instead of being silently stored for next time. Reads back and logs
+   what the camera actually took: it clamps out-of-range values rather than refusing them. */
+static void mv_apply_live(GstMipiMvSrc *src, guint prop_id);
 
 static void gst_mipimv_src_set_property(GObject *object, guint prop_id,
                                     const GValue *value, GParamSpec *pspec)
@@ -221,6 +272,57 @@ static void gst_mipimv_src_set_property(GObject *object, guint prop_id,
         case PROP_BUFFERS:
             src->n_buffers = g_value_get_int(value);
             break;
+
+        /* ---- camera control ---- */
+        case PROP_I2C_BUS:
+            src->i2c_bus = g_value_get_int(value);
+            break;
+        case PROP_I2C_ADDR:
+            src->i2c_addr = g_value_get_int(value);
+            break;
+        case PROP_PROBE:
+            src->probe = g_value_get_boolean(value);
+            break;
+        case PROP_CAM_FPS:
+            src->cam_fps = g_value_get_double(value);
+            break;
+        case PROP_EXPOSURE:
+            src->cam_exposure_us = g_value_get_int(value);
+            mv_apply_live(src, prop_id);
+            break;
+        case PROP_GAIN:
+            src->cam_gain_db = g_value_get_double(value);
+            mv_apply_live(src, prop_id);
+            break;
+        case PROP_CAM_BLACK_LEVEL:
+            src->cam_black_level = g_value_get_int(value);
+            mv_apply_live(src, prop_id);
+            break;
+        case PROP_CAM_GAMMA:
+            src->cam_gamma = g_value_get_double(value);
+            mv_apply_live(src, prop_id);
+            break;
+        case PROP_CAM_DPC:
+            src->cam_dpc = g_value_get_int(value);
+            mv_apply_live(src, prop_id);
+            break;
+        case PROP_CAM_IMGDIR:
+            src->cam_imgdir = g_value_get_int(value);
+            mv_apply_live(src, prop_id);
+            break;
+        case PROP_CAM_TESTIMG:
+            src->cam_testimg = g_value_get_int(value);
+            mv_apply_live(src, prop_id);
+            break;
+        case PROP_CAM_AUTO_EXPOSURE:
+            src->cam_auto_exposure = g_value_get_int(value);
+            mv_apply_live(src, prop_id);
+            break;
+        case PROP_CAM_AUTO_GAIN:
+            src->cam_auto_gain = g_value_get_int(value);
+            mv_apply_live(src, prop_id);
+            break;
+
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
     }
@@ -290,6 +392,48 @@ static void gst_mipimv_src_get_property(GObject *object, guint prop_id,
         case PROP_BUFFERS:
             g_value_set_int(value, src->n_buffers);
             break;
+
+        /* ---- camera control ---- */
+        case PROP_I2C_BUS:
+            g_value_set_int(value, src->i2c_bus);
+            break;
+        case PROP_I2C_ADDR:
+            g_value_set_int(value, src->i2c_addr);
+            break;
+        case PROP_PROBE:
+            g_value_set_boolean(value, src->probe);
+            break;
+        case PROP_CAM_FPS:
+            g_value_set_double(value, src->cam_fps);
+            break;
+        case PROP_EXPOSURE:
+            g_value_set_int(value, src->cam_exposure_us);
+            break;
+        case PROP_GAIN:
+            g_value_set_double(value, src->cam_gain_db);
+            break;
+        case PROP_CAM_BLACK_LEVEL:
+            g_value_set_int(value, src->cam_black_level);
+            break;
+        case PROP_CAM_GAMMA:
+            g_value_set_double(value, src->cam_gamma);
+            break;
+        case PROP_CAM_DPC:
+            g_value_set_int(value, src->cam_dpc);
+            break;
+        case PROP_CAM_IMGDIR:
+            g_value_set_int(value, src->cam_imgdir);
+            break;
+        case PROP_CAM_TESTIMG:
+            g_value_set_int(value, src->cam_testimg);
+            break;
+        case PROP_CAM_AUTO_EXPOSURE:
+            g_value_set_int(value, src->cam_auto_exposure);
+            break;
+        case PROP_CAM_AUTO_GAIN:
+            g_value_set_int(value, src->cam_auto_gain);
+            break;
+
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
     }
@@ -411,6 +555,249 @@ static void build_ghs_lut(unsigned char *lut, int lut_size, float B, float D, fl
 /* ======================== START ======================== */
 // gst-launch-1.0 mipimvsrc format=Y12P framerate=25/1 width=1920 height=1080 ! videoconvert ! filesink location=/tmp/mp2.raw
 //
+/* ======================== CAMERA CONTROL ======================== */
+
+static void mv_apply_live(GstMipiMvSrc *src, guint prop_id)
+{
+    if (!src->i2c || !src->i2c->is_open())
+        return;
+
+    switch (prop_id) {
+        case PROP_EXPOSURE:
+            if (src->cam_exposure_us >= 0) {
+                int got = 0;
+                if (src->i2c->set_exposure_us(src->cam_exposure_us, &got))
+                    g_print("camera: exposure %d us -> %d us\n", src->cam_exposure_us, got);
+                else
+                    g_printerr("camera: exposure failed: %s\n", src->i2c->error().c_str());
+            }
+            break;
+        case PROP_GAIN:
+            if (src->cam_gain_db >= 0.0) {
+                double got = 0;
+                if (src->i2c->set_gain_db(src->cam_gain_db, &got))
+                    g_print("camera: gain %.1f dB -> %.1f dB\n", src->cam_gain_db, got);
+                else
+                    g_printerr("camera: gain failed: %s\n", src->i2c->error().c_str());
+            }
+            break;
+        case PROP_CAM_BLACK_LEVEL:
+            if (src->cam_black_level >= 0) {
+                int got = 0;
+                if (src->i2c->set_black_level(src->cam_black_level, &got))
+                    g_print("camera: black level %d -> %d\n", src->cam_black_level, got);
+            }
+            break;
+        case PROP_CAM_GAMMA:
+            if (src->cam_gamma >= 0.0) {
+                double got = 0;
+                /* A gamma of 0 is how you ask for the curve to be bypassed. */
+                src->i2c->set_gamma_enable(src->cam_gamma > 0.0 ? 1 : 0);
+                if (src->cam_gamma > 0.0 && src->i2c->set_gamma(src->cam_gamma, &got))
+                    g_print("camera: gamma %.2f -> %.2f\n", src->cam_gamma, got);
+            }
+            break;
+        case PROP_CAM_DPC:
+            if (src->cam_dpc >= 0) {
+                src->i2c->set_dpc_enable(src->cam_dpc);
+                g_print("camera: defect pixel correction %s\n", src->cam_dpc ? "on" : "off");
+            }
+            break;
+        case PROP_CAM_IMGDIR:
+            if (src->cam_imgdir >= 0)
+                src->i2c->set_image_direction(src->cam_imgdir);
+            break;
+        case PROP_CAM_TESTIMG:
+            if (src->cam_testimg >= 0)
+                src->i2c->set_test_image(src->cam_testimg);
+            break;
+        case PROP_CAM_AUTO_EXPOSURE:
+            if (src->cam_auto_exposure >= 0)
+                src->i2c->set_exposure_mode(src->cam_auto_exposure);
+            break;
+        case PROP_CAM_AUTO_GAIN:
+            if (src->cam_auto_gain >= 0)
+                src->i2c->set_gain_mode(src->cam_auto_gain);
+            break;
+        default:
+            break;
+    }
+}
+
+/* Reads and logs what the camera is and what it can do. Cheap, and the only way to find out the
+   sensor's real size and limits without the vendor scripts. */
+static void mv_log_probe(MvCam *cam)
+{
+    g_print("camera: %s %s, sensor %s, serial %s, firmware %s\n",
+            cam->id_string(MV_MANUFACTURER).c_str(), cam->id_string(MV_MODEL).c_str(),
+            cam->id_string(MV_SENSOR_NAME).c_str(), cam->id_string(MV_PRODUCT_INFO).c_str(),
+            cam->id_string(MV_DEVICE_VERSION).c_str());
+
+    int w = 0, h = 0;
+    if (cam->sensor_size(&w, &h))
+        g_print("camera: sensor %dx%d\n", w, h);
+
+    int rx = 0, ry = 0, rw = 0, rh = 0;
+    if (cam->get_roi(&rx, &ry, &rw, &rh))
+        g_print("camera: current ROI %dx%d at %d,%d\n", rw, rh, rx, ry);
+
+    double lo = 0, hi = 0;
+    if (cam->framerate_range(&lo, &hi))
+        g_print("camera: frame rate %.2f..%.2f fps\n", lo, hi);
+    if (cam->exposure_range_us(&lo, &hi))
+        g_print("camera: exposure %.1f..%.0f us\n", lo, hi);
+
+    if (cam->min_roi(&w, &h))
+        g_print("camera: smallest ROI %dx%d\n", w, h);
+
+    uint32_t mask = 0;
+    if (cam->format_cap(&mask)) {
+        /* The capability word is a bitmask over the same order as MvPixelFormat. */
+        g_print("camera: formats supported:%s%s%s%s\n",
+                (mask & (1u << MV_FMT_RAW8))  ? " raw8"  : "",
+                (mask & (1u << MV_FMT_RAW10)) ? " raw10" : "",
+                (mask & (1u << MV_FMT_RAW12)) ? " raw12" : "",
+                (mask & (1u << MV_FMT_UYVY))  ? " uyvy"  : "");
+    }
+
+    double t = 0;
+    if (cam->temperature_c(&t))
+        g_print("camera: sensor temperature %.1f C\n", t);
+
+    uint32_t dpc = 0;
+    int bit = 0;
+    if (cam->dpc_count(&dpc) && cam->get_isp_bit(MV_ISP_BIT_DPC, &bit))
+        g_print("camera: defect pixel correction %s, %u pixels in its table\n",
+                bit ? "on" : "off", dpc);
+
+    int us = 0;
+    double db = 0;
+    if (cam->get_exposure_us(&us) && cam->get_gain_db(&db))
+        g_print("camera: now exposing %d us at %.1f dB\n", us, db);
+}
+
+/* Everything that has to be in place before the V4L2 device is opened. Returns FALSE only for a
+   failure that would leave the stream misconfigured; a control that merely could not be written is
+   logged and does not stop the pipeline. */
+static gboolean mv_setup_camera(GstMipiMvSrc *src)
+{
+    if (src->i2c_bus == -1) {
+
+        /* Say so rather than silently dropping them: passing gain=30 and getting no gain change is a
+           confusing way to find out that camera control is off by default. */
+        GString *ignored = g_string_new(NULL);
+        if (src->cam_exposure_us >= 0)   g_string_append(ignored, " exposure");
+        if (src->cam_gain_db >= 0.0)     g_string_append(ignored, " gain");
+        if (src->cam_fps >= 0.0)         g_string_append(ignored, " cam-fps");
+        if (src->cam_black_level >= 0)   g_string_append(ignored, " cam-black-level");
+        if (src->cam_gamma >= 0.0)       g_string_append(ignored, " cam-gamma");
+        if (src->cam_dpc >= 0)           g_string_append(ignored, " cam-dpc");
+        if (src->cam_imgdir >= 0)        g_string_append(ignored, " cam-imgdir");
+        if (src->cam_testimg >= 0)       g_string_append(ignored, " cam-testimg");
+        if (src->cam_auto_exposure >= 0) g_string_append(ignored, " cam-auto-exposure");
+        if (src->cam_auto_gain >= 0)     g_string_append(ignored, " cam-auto-gain");
+        if (src->probe)                  g_string_append(ignored, " probe");
+
+        if (ignored->len)
+            g_printerr("mipimvsrc: i2c-bus is -1, so the camera is left alone and these were "
+                       "ignored:%s. Add i2c-bus=-2 to apply them.\n", ignored->str);
+
+        g_string_free(ignored, TRUE);
+        return TRUE;
+    }
+
+    /* An explicit bus number is a request, so failing to reach it is an error. Autodetection is a
+       convenience, so not finding a camera only costs the camera control - the pipeline still runs,
+       exactly as it does with i2c-bus=-1. The one case that must not be papered over is two cameras:
+       nothing here ties a bus to a /dev/video node, so picking one would configure the wrong camera
+       on a two-camera board. */
+    gboolean detecting = (src->i2c_bus == -2);
+    int bus = src->i2c_bus;
+
+    if (detecting) {
+        /* First ask which camera actually feeds this capture node, by walking the media graph. That is
+           the only answer that stays right with two cameras on one board. */
+        bus = MvCam::detect_bus_for_video(src->device, src->i2c_addr);
+
+        if (bus >= 0) {
+            g_print("camera: %s is fed by the camera on bus %d\n", src->device, bus);
+        } else {
+            /* No media graph to follow, so fall back to looking for a camera anywhere, which can only
+               be trusted when there is exactly one. */
+            int n = 0;
+            bus = MvCam::detect_bus(src->i2c_addr, &n);
+
+            if (bus == MVCAM_DETECT_AMBIGUOUS) {
+                g_printerr("camera: %d cameras on this board and the media graph did not say which "
+                           "one feeds %s. Give the bus number explicitly.\n", n, src->device);
+                return FALSE;
+            }
+            if (bus == MVCAM_DETECT_NONE) {
+                g_print("camera: no veye_mvcam found, continuing without camera control\n");
+                return TRUE;
+            }
+            g_print("camera: detected on bus %d\n", bus);
+        }
+    }
+
+    src->i2c = new MvCam();
+    if (!src->i2c->open(bus, src->i2c_addr)) {
+        g_printerr("camera: %s\n", src->i2c->error().c_str());
+        delete src->i2c;
+        src->i2c = NULL;
+        /* Usually a permissions problem: the user needs to be in the i2c group. Worth saying out
+           loud, but not worth refusing to capture over when it was only autodetection asking. */
+        if (detecting) {
+            g_print("camera: continuing without camera control\n");
+            return TRUE;
+        }
+        return FALSE;
+    }
+    g_print("camera: control on /dev/i2c-%d at 0x%02x\n", bus, src->i2c_addr);
+
+    if (src->probe)
+        mv_log_probe(src->i2c);
+
+    /* The ROI the driver has, purely so a mismatch with this element's width and height is visible
+       in the log instead of showing up as a sheared image. Not written: the driver owns it. */
+    int rx = 0, ry = 0, rw = 0, rh = 0;
+    if (src->i2c->get_roi(&rx, &ry, &rw, &rh)) {
+        g_print("camera: ROI %dx%d at %d,%d\n", rw, rh, rx, ry);
+        if (rw != src->width || rh != src->height)
+            g_printerr("camera: ROI is %dx%d but this element is set to %dx%d. Fix the "
+                       "media_setting_rpi5.sh call; unpacking a mismatched size shears the image.\n",
+                       rw, rh, src->width, src->height);
+    }
+
+    /* Frame rate. 0 takes it from the framerate property, so the camera and the negotiated caps
+       cannot drift apart. Written here and not live: changing it mid-stream would leave the caps
+       claiming a rate the camera no longer delivers. */
+    double want_fps = src->cam_fps;
+    if (want_fps == 0.0 && src->fps_d > 0)
+        want_fps = (double)src->fps_n/src->fps_d;
+    if (want_fps > 0.0) {
+        double got = 0;
+        if (src->i2c->set_framerate(want_fps, &got))
+            g_print("camera: frame rate %.2f -> %.2f fps\n", want_fps, got);
+        else
+            g_printerr("camera: frame rate failed: %s\n", src->i2c->error().c_str());
+    }
+
+    /* Modes before values: writing a manual exposure while the camera is in auto mode is accepted and
+       then immediately overridden by the auto loop. */
+    mv_apply_live(src, PROP_CAM_AUTO_EXPOSURE);
+    mv_apply_live(src, PROP_CAM_AUTO_GAIN);
+    mv_apply_live(src, PROP_EXPOSURE);
+    mv_apply_live(src, PROP_GAIN);
+    mv_apply_live(src, PROP_CAM_BLACK_LEVEL);
+    mv_apply_live(src, PROP_CAM_GAMMA);
+    mv_apply_live(src, PROP_CAM_DPC);
+    mv_apply_live(src, PROP_CAM_IMGDIR);
+    mv_apply_live(src, PROP_CAM_TESTIMG);
+
+    return TRUE;
+}
+
 static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
 {
     GstMipiMvSrc *src = (GstMipiMvSrc *)basesrc;
@@ -461,6 +848,11 @@ static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
 
         build_ghs_lut(src->lut, src->lut_size, B, D, SP, src->black_level);
     }
+
+    /* Before the device: the sensor format and ROI decide the byte layout the capture side will see,
+       so they cannot be changed once the stream is up. */
+    if (!mv_setup_camera(src))
+        return FALSE;
 
     src->cap = new cv::VideoCapture();
 
@@ -537,6 +929,11 @@ static gboolean gst_mipimv_src_stop(GstBaseSrc *basesrc)
 
     g_free(src->lut);
     src->lut = NULL;
+
+    if (src->i2c) {
+        delete src->i2c;
+        src->i2c = NULL;
+    }
 
     return TRUE;
 }
@@ -997,6 +1394,95 @@ static void gst_mipimv_src_class_init(GstMipiMvSrcClass *klass)
                          0, 10, 0,
                          (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
+    /* ---- camera control over I2C ----
+       Off unless i2c-bus is given, so pipelines that rely on set_params.sh are unaffected. */
+    g_object_class_install_property(gobject_class, PROP_I2C_BUS,
+        g_param_spec_int("i2c-bus", "I2C bus",
+            "Bus number in /dev/i2c-N carrying the camera's control block. "
+            "-1 leaves the camera entirely alone, which is the default. "
+            "-2 works it out: it walks the media graph to find which camera feeds this device, which "
+            "stays correct with two cameras on one board, and falls back to looking for a single "
+            "camera anywhere. Best effort - if none is found, or the bus cannot be opened, capture "
+            "carries on without camera control. An explicit number is taken as a request, so failing "
+            "to reach it is an error.",
+            -2, 255, -1, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_I2C_ADDR,
+        g_param_spec_int("i2c-addr", "I2C address",
+            "I2C address of the control block. 0x3b on every MV camera seen so far.",
+            0, 127, MVCAM_I2C_ADDR, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_PROBE,
+        g_param_spec_boolean("probe", "Probe the camera",
+            "Log model, serial, firmware, sensor size, limits, temperature and the defect pixel "
+            "table size at start.",
+            FALSE, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_CAM_FPS,
+        g_param_spec_double("cam-fps", "Sensor frame rate",
+            "Frame rate to program into the camera. -1 leaves it alone, 0 takes it from the framerate "
+            "property. Applied at start only. The driver also has a working frame_rate control, which "
+            "is the tidier layer but is limited to whole frames; this writes the register directly and "
+            "takes hundredths. The only cost is that the driver's sysfs fps file stays stale until "
+            "something reads the register again.",
+            -1.0, 1000.0, -1.0, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_EXPOSURE,
+        g_param_spec_int("exposure", "Exposure time",
+            "Manual exposure in microseconds, -1 to leave alone. Can be changed while running. "
+            "Set cam-auto-exposure=0 as well, or the auto loop overrides it. Written over I2C because "
+            "the driver's V4L2_CID_EXPOSURE only stores the value and never reaches the camera.",
+            -1, 100000000, -1, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_GAIN,
+        g_param_spec_double("gain", "Analog gain",
+            "Manual gain in dB, -1 to leave alone. Can be changed while running. Set cam-auto-gain=0 "
+            "as well, or the auto loop overrides it. Written over I2C for the same reason as exposure: "
+            "the driver's V4L2_CID_ANALOGUE_GAIN is a stub.",
+            -1.0, 100.0, -1.0, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_CAM_BLACK_LEVEL,
+        g_param_spec_int("cam-black-level", "Sensor black level",
+            "Black level in the camera, -1 to leave alone. This is the sensor's own offset and is a "
+            "different thing from the black-level property, which only shifts the software curve.",
+            -1, 65535, -1, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_CAM_GAMMA,
+        g_param_spec_double("cam-gamma", "Sensor gamma",
+            "Gamma applied inside the camera. -1 leaves it alone, 0 turns the curve off, a positive "
+            "value sets and enables it. Unrelated to the gamma property, which is the software curve "
+            "this element applies when mapping down to 8 bits.",
+            -1.0, 10.0, -1.0, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_CAM_DPC,
+        g_param_spec_int("cam-dpc", "Defect pixel correction",
+            "Correction of defective pixels in the camera: -1 leave, 0 off, 1 on. Worth trying on a "
+            "sensor with many hot pixels, since it removes them before they ever reach the host.",
+            -1, 1, -1, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_CAM_IMGDIR,
+        g_param_spec_int("cam-imgdir", "Image direction",
+            "Orientation: -1 leave, 0 normal, 1 mirror, 2 flip, 3 both.",
+            -1, 3, -1, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_CAM_TESTIMG,
+        g_param_spec_int("cam-testimg", "Test pattern",
+            "Built-in test image: -1 leave, 0 off, 1 and 2 are vertical bar patterns. Useful for "
+            "telling a transport problem apart from a sensor one.",
+            -1, 15, -1, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_CAM_AUTO_EXPOSURE,
+        g_param_spec_int("cam-auto-exposure", "Exposure mode",
+            "-1 leave, 0 manual, 1 auto once, 2 auto continuous. Use 0 for a meteor station: a "
+            "changing exposure makes photometry between frames incomparable.",
+            -1, 2, -1, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_CAM_AUTO_GAIN,
+        g_param_spec_int("cam-auto-gain", "Gain mode",
+            "-1 leave, 0 manual, 1 auto once, 2 auto continuous. Use 0 for a meteor station, for the "
+            "same reason as cam-auto-exposure.",
+            -1, 2, -1, G_PARAM_READWRITE));
+
     g_object_class_install_property(gobject_class, PROP_THREADS,
         g_param_spec_int("threads", "Threads",
                          "How many threads unpack the frame. The work splits cleanly, so this scales "
@@ -1042,6 +1528,23 @@ static void gst_mipimv_src_init(GstMipiMvSrc *src)
     src->stamps = STAMP_DRIVER;
     src->first_driver_ms = -1.0;
     src->frame_count = 0;
+
+    /* Camera control off by default: a bus of -1 means this element never touches I2C, so existing
+       pipelines keep working exactly as before and set_params.sh stays in charge. */
+    src->i2c = NULL;
+    src->i2c_bus = -1;
+    src->i2c_addr = MVCAM_I2C_ADDR;
+    src->probe = FALSE;
+    src->cam_fps = -1.0;
+    src->cam_exposure_us = -1;
+    src->cam_gain_db = -1.0;
+    src->cam_black_level = -1;
+    src->cam_gamma = -1.0;
+    src->cam_dpc = -1;
+    src->cam_imgdir = -1;
+    src->cam_testimg = -1;
+    src->cam_auto_exposure = -1;
+    src->cam_auto_gain = -1;
 
     gst_base_src_set_live(GST_BASE_SRC(src), TRUE);
 }

@@ -6,7 +6,7 @@
 #   make clean
 
 PLUGIN   := libgstmipimvsrc.so
-SRC      := gstmipimvsrc.cpp
+SRC      := gstmipimvsrc.cpp mvcam.cpp
 
 # -O3 is not optional here: the unpacking loop measured 3.2x slower without it, which is the
 # difference between fitting in the frame budget and dropping frames.
@@ -31,7 +31,7 @@ check-deps:
 		echo "  sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libopencv-dev"; \
 		exit 1; }
 
-$(PLUGIN): $(SRC)
+$(PLUGIN): $(SRC) mvcam.h
 	$(CXX) $(CXXFLAGS) $(PKGFLAGS) $(LDFLAGS) -o $@ $< $(PKGLIBS)
 
 install: $(PLUGIN)

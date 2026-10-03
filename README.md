@@ -54,6 +54,29 @@ between fitting in the frame budget and dropping frames.
 | `threads` | 1 | Threads used for unpacking |
 | `buffers` | 0 | Driver queue depth, at most 10. 0 leaves the driver's own choice |
 
+### Camera control
+
+These are off unless `i2c-bus` is set, so existing pipelines are unaffected.
+
+| property | default | what it does |
+|---|---|---|
+| `i2c-bus` | -1 | -1 touches nothing, -2 finds the bus itself, or give the number |
+| `i2c-addr` | 0x3b | Address of the control block |
+| `probe` | false | Log model, serial, firmware, limits, temperature at start |
+| `exposure` | -1 | Exposure in microseconds |
+| `gain` | -1 | Gain in dB |
+| `cam-auto-exposure` | -1 | 0 manual, 1 auto once, 2 auto continuous |
+| `cam-auto-gain` | -1 | Same values |
+| `cam-fps` | -1 | Frame rate; 0 takes it from `framerate`. Start only |
+| `cam-black-level` | -1 | The sensor's own offset |
+| `cam-gamma` | -1 | Camera gamma; 0 disables the curve |
+| `cam-dpc` | -1 | Defect pixel correction, 0 off, 1 on |
+| `cam-imgdir` | -1 | 0 normal, 1 mirror, 2 flip, 3 both |
+| `cam-testimg` | -1 | Built-in test pattern |
+
+`-1` everywhere means "leave whatever the camera already has", so you can set one control without
+disturbing the rest.
+
 ### Transfer curves
 
 `lin` keeps the top 8 bits. Linear, and by far the cheapest, since the answer is the packed high byte
@@ -136,6 +159,148 @@ is not long enough to ride out the pause when RMS hands a block of 256 frames to
 frames are lost once per block. Raising it to 10, OpenCV's own ceiling, stopped that. Asking for more
 than 10 leaves the device with no buffers at all and every read returns empty.
 
+## Camera control
+
+This camera exposes nothing through V4L2 controls. Exposure, gain, frame rate, black level, ROI and
+the sensor's own pixel format all live in an I2C register space, which the vendor drives with
+`mv_mipi_i2c.sh` and two small helper binaries. That protocol is reimplemented here directly, so the
+element does not shell out and does not care where the vendor scripts live.
+
+### What this element sets, and what it deliberately does not
+
+The split follows who owns each register. The `veye_mvcam` driver writes `Pixel_Format` and the ROI
+registers itself from the media-ctl format, and its `frame_rate`, `roi_x` and `roi_y` V4L2 controls
+work. Writing any of those over I2C would leave the driver's cached state disagreeing with the
+hardware, so this element does not touch them - use `media_setting_rpi5.sh` and `v4l2-ctl`.
+
+Exposure and gain are the opposite case. The driver registers `V4L2_CID_EXPOSURE` and
+`V4L2_CID_ANALOGUE_GAIN`, but its handler only stores the number - the fields are commented
+`//just save the value` in the driver source and are never written to the camera. That is why the
+vendor's own `set_params.sh` sets them over I2C, and why this element does too.
+
+| parameter | who owns it | how to set it |
+|---|---|---|
+| pixel format, ROI size | driver, from the media-ctl format | `media_setting_rpi5.sh -fmt -w -h` |
+| ROI offset | driver, working V4L2 control | `media_setting_rpi5.sh -x -y`, or `v4l2-ctl --set-ctrl roi_x=` |
+| frame rate | driver has a working control, but the register is safe to write | **this element**, or `v4l2-ctl --set-ctrl frame_rate=25` |
+| exposure, gain | nobody - the V4L2 controls are stubs | **this element**, or `mv_mipi_i2c.sh` |
+| black level, gamma, DPC, test image, orientation | nobody | **this element**, or `mv_mipi_i2c.sh` |
+
+Frame rate is the one borderline case. The driver's `frame_rate` control works, which makes it the
+tidier layer, but it only takes whole frames. Writing the register directly leaves nothing but the
+driver's `cur_fps` cache stale - its getter and its ROI path both re-read the register - so `cam-fps`
+is provided and takes hundredths of a frame. Either path is fine.
+
+So this replaces everything `mv_mipi_i2c.sh` was doing in `set_params.sh`, and none of the geometry:
+
+```
+mipimvsrc device=/dev/video8 i2c-bus=-2 probe=true \
+    format=Y12P trans=gamma gamma=0.7 black-level=199 \
+    cam-auto-exposure=0 cam-auto-gain=0 exposure=40000 gain=30 cam-fps=0 \
+    stamps=driver threads=2 buffers=10 width=2400 height=2064 framerate=25/1 \
+  ! video/x-raw,format=GRAY8,width=2400,height=2064,framerate=25/1 \
+  ! queue max-size-buffers=20 max-size-bytes=0 max-size-time=0 \
+  ! appsink max-buffers=100 drop=true sync=0 name=appsink
+```
+
+The geometry still comes from the first line of `set_params.sh`, unchanged:
+
+```sh
+rpi5_scripts/media_setting_rpi5.sh mvcam -fmt RAW12 -x 344 -y 0 -w 2400 -h 2064 -c 1
+```
+
+The element reads the ROI back and compares it with `width` and `height`, so a mismatch shows up as a
+line in the log rather than as a sheared image:
+
+```
+camera: ROI 2400x2064 at 344,0
+```
+
+### Which bus
+
+`i2c-bus=-2` works it out. It walks sysfs to find the media device that owns your capture node, then
+asks that media device for its entity names: the sensor appears as `mvcam 4-003b`, so the bus number
+is in the name. That ties the answer to the `device` you gave, which is what makes it correct on a
+board with two cameras:
+
+```
+camera: /dev/video8 is fed by the camera on bus 4
+```
+
+If there is no media graph to follow it falls back to looking for a camera anywhere in sysfs, which
+can only be trusted when there is exactly one - with two it reports the count and stops rather than
+configuring whichever it found first.
+
+The two spellings differ in how they fail:
+
+- **`-2` is best effort.** No camera found, or a bus that cannot be opened (usually because the user is
+  not in the `i2c` group), logs a line and capture carries on without camera control. Nothing that
+  worked before starts failing because of it.
+- **An explicit number is a request**, so a bus that cannot be opened fails the pipeline. If you asked
+  for bus 4, silently ignoring it would be worse than stopping.
+
+Two cameras need nothing special, but an explicit bus is still the shortest thing to debug:
+
+```
+mipimvsrc device=/dev/video8 i2c-bus=-2 ...
+mipimvsrc device=/dev/video0 i2c-bus=-2 ...
+```
+
+To see the pairing by hand:
+
+```sh
+ls -d /sys/bus/i2c/devices/i2c-*/*-003b/veye_mvcam
+media-ctl -d /dev/media0 -p | grep entity
+```
+
+### Setting controls with i2c-bus left at -1
+
+They are ignored, because `-1` means the element does not open I2C at all. It says so at start rather
+than leaving you to wonder why the gain did not change:
+
+```
+mipimvsrc: i2c-bus is -1, so the camera is left alone and these were ignored: exposure gain.
+           Add i2c-bus=-2 to apply them.
+```
+
+### Why the default is -1 and not -2
+
+Because `-1` means *off*, not *figure it out*: with it this element does not open I2C at all and the
+camera is configured by `mv_mipi_i2c.sh` as before. Leaving that as the default keeps every existing
+pipeline behaving exactly as it did. Turning camera control on is one argument.
+
+### Setting controls while running
+
+`exposure`, `gain`, `cam-black-level`, `cam-gamma`, `cam-dpc`, `cam-imgdir`, `cam-testimg` and the two
+auto modes take effect immediately when set on a running pipeline. `cam-fps` is applied at start only:
+changing it mid-stream would leave the negotiated caps claiming a rate the camera no longer delivers. Every write is read back and logged,
+because the camera clamps values out of range rather than refusing them:
+
+```
+camera: gain 30.0 dB -> 30.0 dB
+camera: exposure 40000 us -> 39997 us
+```
+
+Pair the manual values with `cam-auto-exposure=0` and `cam-auto-gain=0`. Writing a manual exposure
+while the camera is still in an auto mode is accepted and then immediately overridden by the auto loop,
+which looks like the write having silently failed. For a meteor station the auto modes are wrong
+anyway: an exposure that moves makes photometry between frames incomparable.
+
+### Two properties that are easy to confuse
+
+`black-level` and `gamma` are the **software** curve this element applies while mapping down to 8 bits.
+`cam-black-level` and `cam-gamma` are the **camera's own** settings and are a different thing. In the
+example above the camera's gamma is left alone and the mapping is done here, because that is the one
+curve RMS can invert.
+
+### Defect pixel correction
+
+`cam-dpc=1` has the camera correct its own defective pixels, and `probe=true` reports how many are in
+its table. On a sensor with a lot of hot pixels this is worth trying: it removes them before they ever
+reach the host, which is cheaper than masking them afterwards. Measurements on an IMX178 with this
+lens found about 1700 pixels standing more than 8 levels above their surroundings, and masking them
+cut the detections that were not stars by 58 to 80%.
+
 ## Use with RMS
 
 RMS parses the device string itself when it names its sink `name=appsink`, rather than handing it to
@@ -168,5 +333,10 @@ gamma: 0.7
   its own timeout if the camera has stopped delivering.
 - Camera controls such as exposure and gain are not exposed; set them with `v4l2-ctl`.
 - The driver queue cannot go above 10 buffers, which is OpenCV's limit, not the driver's.
+- Camera control sets only what the driver does not own, so `media_setting_rpi5.sh` is still required
+  for format and geometry. The ROI is read back and checked, never written.
+- Trigger mode, the LUT and the auto-exposure ROI are reachable over the same register space but are
+  not exposed. Trigger has working V4L2 controls (`trigger_mode`, `trigger_src`, `soft_trgone`), so it
+  belongs to `v4l2-ctl`, not here.
 - No SER or FITS writing. GStreamer has no SER support either, though the format is simple enough
   that a sink would be short work once 16 bit output is being recorded.
