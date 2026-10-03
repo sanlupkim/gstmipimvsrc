@@ -1,3 +1,19 @@
+/* mipimvsrc - a GStreamer source for MIPI machine vision cameras
+ *
+ * Copyright (C) 2026 Lukasz Sanocki
+ *
+ * This program is free software: you can redistribute it and/or modify it under the terms of the GNU
+ * General Public License as published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along with this program. If not,
+ * see <https://www.gnu.org/licenses/>.
+ */
+
 #ifndef PACKAGE
 #define PACKAGE "mipimvsrc"
 #endif
@@ -1565,7 +1581,7 @@ GST_PLUGIN_DEFINE(
     "MIPI Machine Vision Camera plugin",
     plugin_init,
     "1.0",
-    "LGPL",
+    "GPL",
     "mipimvsrc",
     "mipimvsrc"
 )

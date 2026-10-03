@@ -340,3 +340,42 @@ gamma: 0.7
   belongs to `v4l2-ctl`, not here.
 - No SER or FITS writing. GStreamer has no SER support either, though the format is simple enough
   that a sink would be short work once 16 bit output is being recorded.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+**Why GPL at all:** the register map, the scaling factors and the I2C transfer format in `mvcam.cpp`
+were worked out from the vendor's tools in
+[veyeimaging/raspberrypi_v4l2](https://github.com/veyeimaging/raspberrypi_v4l2) - specifically
+`mv_tools_rpi/mv_mipi_i2c_new.sh` and `mv_tools_rpi/sources/i2c_4read.c` / `i2c_4write.c`. Register
+addresses are arguably interface rather than expression, but the protocol was reimplemented after
+reading their code closely, so treating this as a derived work is the honest position.
+
+That repository is **internally inconsistent about its licence**, which is worth recording because it
+is awkward to reconstruct later:
+
+| | licence |
+|---|---|
+| repository root `LICENSE` | GPL-3.0, full text |
+| the userspace tools this derives from | no per-file header, so the root `LICENSE` governs → GPL-3 |
+| the kernel driver `veye_mvcam.c` | `SPDX-License-Identifier: GPL-2.0` and `MODULE_LICENSE("GPL v2")` |
+
+GPL-2.0-only and GPL-3 are incompatible, so that distinction matters. **Nothing here is derived from the
+driver.** It was read only to establish facts about behaviour - which registers it writes from the
+media-ctl format, and that its `exp_val` / `again_val` never reach the camera - and those findings are
+recorded as comments, not as code. The register addresses appear in both the GPL-3 script and the
+driver's GPL-2 header; they were taken from the script, and in any case an address is a fact about an
+interface.
+
+**Why version 3 and not 2:** the element links OpenCV, whose Apache-2.0 patent clause is compatible
+with GPL-3 but not with GPL-2. GStreamer itself is LGPL-2.1-or-later, which a GPL-3 plugin may link.
+
+**What this does not affect:** [RMS](https://github.com/CroatianMeteorNetwork/RMS). None of its code is
+here and none of its headers are included - it only runs a pipeline that happens to contain this
+element. Its own licence imposes nothing on this module, and this module imposes nothing on RMS.
+GStreamer loads this plugin into whichever process runs the pipeline, so strictly speaking the two end
+up in one address space, but RMS is GPL-3 as well, so there is no friction either way.
+
+`GST_PLUGIN_DEFINE` declares `"GPL"` accordingly. It used to say `"LGPL"`, which GStreamer would have
+taken at face value when checking whether this plugin may sit in a pipeline with others.
