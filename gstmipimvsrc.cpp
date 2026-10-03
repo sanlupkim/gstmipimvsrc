@@ -150,6 +150,7 @@ typedef struct _GstMipiMvSrc {
     gint cam_lut;
     gint cam_blc;
     gboolean cam_curve;
+    gboolean curve_in_camera;   /* set once the upload succeeded */
 
     /* Baseline of the camera's own frame counters, taken at start. The difference at stop says whether
        the camera dropped frames before the host ever saw them, which looks identical to a host problem
@@ -862,13 +863,12 @@ static gboolean mv_upload_curve(GstMipiMvSrc *src, float B, float D, float SP)
     g_print("camera: uploaded a %u entry %s curve and enabled it\n", count,
             (src->trans == TRANS_GHS) ? "GHS" : (src->trans == TRANS_GAMMA) ? "gamma" : "lsb");
 
-    /* With the curve in the camera the host must not apply a second one. GRAY8 input with trans=lin is
-       the pass-through case; anything else means the frame gets curved twice. */
-    if (src->format != FORMAT_GRAY8)
-        g_printerr("camera: format=%s still unpacks and curves on the host, so the curve is applied "
-                   "TWICE. Set the camera to Mono8 in media_setting_rpi5.sh and use format=GRAY8.\n",
-                   (src->format == FORMAT_Y10P) ? "Y10P" : "Y12P");
-
+    /* The host must now stop curving, and that is not optional. The uploaded table already folds in
+       black-level, so the camera's output has black at zero; applying the host curve on top subtracts
+       the black level a second time and everything below it clamps to zero. The first version of this
+       only warned when format was not GRAY8, which missed the real problem: even with GRAY8 the host
+       table maps everything under black-level to black, so the frame came out completely black. */
+    src->curve_in_camera = TRUE;
     return TRUE;
 }
 
@@ -877,6 +877,10 @@ static gboolean mv_upload_curve(GstMipiMvSrc *src, float B, float D, float SP)
    logged and does not stop the pipeline. */
 static gboolean mv_setup_camera(GstMipiMvSrc *src)
 {
+    /* Cleared on every start: a pipeline that goes READY and back must not inherit a stale TRUE from
+       a previous run whose upload happened to succeed. */
+    src->curve_in_camera = FALSE;
+
     if (src->i2c_bus == -1) {
 
         /* Say so rather than silently dropping them: passing gain=30 and getting no gain change is a
@@ -1062,6 +1066,25 @@ static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
     if (!mv_setup_camera(src))
         return FALSE;
 
+    /* The camera is now applying the curve, so the host's job is reduced to taking the top 8 bits -
+       which for GRAY8 input is the identity, and for Y10P/Y12P is the plain division the `lin` mode
+       does. Anything else would curve the frame twice. Rebuilt here rather than earlier because only
+       the upload can say whether it succeeded. */
+    if (src->curve_in_camera) {
+        int div = src->lut_size/256;
+        if (div < 1)
+            div = 1;
+        for (int i = 0; i < src->lut_size; i++)
+            src->lut[i] = (unsigned char)MIN(i/div, 255);
+
+        g_print("camera: curve is in the camera, so this element only takes the top 8 bits%s\n",
+                (src->format == FORMAT_GRAY8) ? " (a straight copy)" : "");
+
+        if (src->format != FORMAT_GRAY8)
+            g_print("camera: set the camera to Mono8 and format=GRAY8 to also drop the unpacking "
+                    "and halve the MIPI payload\n");
+    }
+
     src->cap = new cv::VideoCapture();
 
     if (is_number(src->device)) {
@@ -1112,7 +1135,10 @@ static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
             g_warning("mipimvsrc: driver kept its own buffer count, %d not applied", want);
     }
 
-    src->high_byte_only = (src->trans == TRANS_LIN) && (src->format != FORMAT_GRAY8);
+    /* With the curve in the camera the host table is the plain top-8-bits ramp, which is exactly what
+       the fast path computes without a lookup. */
+    src->high_byte_only = ((src->trans == TRANS_LIN) || src->curve_in_camera)
+                          && (src->format != FORMAT_GRAY8);
 
     src->duration = gst_util_uint64_scale_int(GST_SECOND, src->fps_d, src->fps_n);
     src->frame_count = 0;
@@ -1804,6 +1830,7 @@ static void gst_mipimv_src_init(GstMipiMvSrc *src)
     src->cam_lut = -1;
     src->cam_blc = -1;
     src->cam_curve = FALSE;
+    src->curve_in_camera = FALSE;
     src->fc_valid = FALSE;
 
     gst_base_src_set_live(GST_BASE_SRC(src), TRUE);

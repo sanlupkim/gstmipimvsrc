@@ -417,9 +417,22 @@ with the camera configured for Mono8 rather than RAW12:
 rpi5_scripts/media_setting_rpi5.sh mvcam -fmt RAW8 -x 344 -y 0 -w 2400 -h 2064 -c 1
 ```
 
-Two things to get right. **`format` must be `GRAY8`**, or the host unpacks and curves the frame a
-second time - the element says so loudly rather than letting it happen quietly. And uploading the curve
-turns the camera's internal gamma off, so do not also set `cam-gamma`; the uploaded table is the curve.
+Once the upload succeeds the element **stops curving by itself**, and this is not left to the user to
+arrange. The uploaded table already folds in `black-level`, so the camera's output has black at zero;
+applying the host curve on top would subtract the black level a second time and everything below it
+would clamp to zero. The host table is replaced by the plain top-8-bits ramp, which is the identity for
+`GRAY8` input, and the `trans=lin` fast path is used so there is no lookup at all.
+
+This is worth stating because the first version only *warned* when `format` was not `GRAY8`, which
+missed the real problem: with `black-level=199` the host table maps everything under 199 to black, so
+even `GRAY8` came out completely black. Measured on the first test night: avepixel median 0, max 255 -
+only the pixels whose camera output already exceeded 199 survived.
+
+`format=GRAY8` with the camera in Mono8 is still what you want, because that is what drops the
+unpacking and halves the MIPI payload. With `Y12P` the feature works, it simply saves less.
+
+Do not also set `cam-gamma`: uploading the curve turns the camera's internal gamma off, and the
+uploaded table is the curve.
 
 The table is scaled to `255*(count/256)`, which is 4080 rather than 4095, because the rounding divides
 by 16 and `4095/16` is 255.94 - filling the table to its maximum leaves every value a level high.
