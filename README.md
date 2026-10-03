@@ -155,6 +155,18 @@ conversion; the simplest arrangement today is a second pipeline for the occasion
 `driver` takes the kernel's own capture time. Unaffected by how long this element waits to be
 scheduled, so it neither drifts nor jitters. Use it.
 
+The first frame is anchored to the pipeline's running time rather than to zero, and that detail matters.
+The camera can take seconds to deliver frame one - starting the stream, settling the sensor, and with
+`cam-curve` also the two and a half second LUT transfer - and a PTS of zero hands all of that back as a
+constant error in every absolute timestamp downstream. RMS computes its frame time as
+`start_timestamp + pts`, so a session whose first frame arrived four seconds late had every frame dated
+four seconds early, and reported `Buffer fill: 100.0%` with no dropped frames for the whole night. The
+element now prints the offset it anchored at:
+
+```
+mipimvsrc: first frame 3.812 s after the pipeline started, anchoring the driver timestamps there
+```
+
 `clock` reads the pipeline clock when the frame arrives here. Correct on average, but any scheduling
 delay shows up as jitter, and RMS resets its PTS smoothing whenever a frame lands more than one
 interval late.
