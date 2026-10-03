@@ -355,50 +355,57 @@ pixels standing more than 8 levels above their surroundings, and masking them cu
 were not stars by 58 to 80%. Whether `cam-dpc=1` covers any of those is worth testing empirically:
 enable it, collect a night, rebuild the fixed pattern and compare the count.
 
-### Could the curve move into the camera?
+### Moving the curve into the camera
 
-The camera has a user LUT: 4096 entries, 12 bit in, 12 bit out. The vendor's own samples are exactly
-`4095*(i/4095)^gamma`, matching to 1 ADU, so it is the same shape of curve this element applies in
-`convertRows`. Moving it into the camera would be worth a lot:
+`cam-curve=true` builds this element's transfer curve at the camera's own LUT resolution, uploads it,
+and lets the camera apply it. With the camera set to Mono8 the frame then arrives already curved and the
+element has nothing left to do.
 
-- the unpacking and table lookup disappear, which is 2.4 ms per frame on the `lin` fast path and 5.7 ms
-  with a curve, single threaded at 2400x2064
-- asking for `RAW8` output halves the MIPI payload, 186 MB/s down to 124 MB/s per camera at 25 fps
-- and the tonal spread would be ours rather than the camera's own 8 bit curve, which on this sensor put
-  the whole sky inside about 5 output levels
+**This is measured, not assumed.** `LUT Count` (0xC74) reports 4096 entries in Mono12 *and in Mono8*,
+1024 in Mono10 - so the table works on the sensor's 12 bit values, before the logic unit the vendor
+describes as performing *"data rounding to achieve a different pixel format"*. And the table really does
+reach raw data: with a gamma 0.5 curve loaded, a population sitting at 199 came back at 903, where
+`4095*(199/4095)^0.5` is 903.
 
-**The LUT does not change the output format.** It is 12 bit in, 12 bit out; with `pixelformat` set to
-Mono12 you still get Mono12. Eight bit output comes from `pixelformat=0` (Mono8), and the vendor's guide
-describes how: *"the AD bits of the sensor is always 12 bits, and the logic unit performs data rounding
-to achieve a different pixel format"*. So the whole idea rests on **where the LUT sits relative to that
-rounding**.
+What it buys, per camera:
 
-If it is before, uploading our gamma and asking for Mono8 gives back exactly what `convertRows` would
-have produced, for free. If it is after, the LUT only reshapes values that have already lost the faint
-end, which is no use.
+| | before | after |
+|---|---|---|
+| host CPU per frame | 2.4 ms (`lin`) to 5.7 ms (a curve), single threaded at 2400x2064 | nothing |
+| MIPI payload at 25 fps | 186 MB/s | **124 MB/s** |
+| tonal spread | ours | still ours, unlike the camera's own 8 bit curve |
 
-`LUT Count` (0xC74) answers it with one read per format, because it is read-only and the camera reports
-how many entries it wants - `lut_rw` reads it before sending anything. The vendor ships samples in two
-sizes, `10bitdepth` (1024) and `12bitdepth` (4096), so it tracks a bit depth:
+That last column is the point worth repeating. The camera's built-in Mono8 curve put the whole sky
+inside about 5 output levels on this sensor; gamma 0.5 spreads it over 40. `cam-curve` keeps the second
+figure while paying the first column's price of nothing.
 
-| what Mono8 reports | what it means |
-|---|---|
-| 4096 | the LUT works on 12 bit values, before the rounding - the idea works |
-| 256 | the LUT is applied after the reduction - no use |
-| nothing | no LUT in that mode |
+Set `trans`, `gamma`, `black-level` and the `ghs-*` parameters exactly as before - they describe the
+curve either way. All four `trans` modes can move, including `ghs`, which gives the best spread of the
+four but which RMS cannot invert, so it suits a preview or a long-exposure stack rather than photometry.
 
-`test_lut_path.sh` reads that first, then confirms separately that the LUT reaches RAW data at all by
-uploading a gamma 0.5 curve, which is unmistakable - a pixel at 1024 becomes 2048, one at 256 becomes
-1024 - capturing before and after and comparing. It restores the LUT, the enable bit and the pixel
-format, and writes no flash. Run it with RMS stopped, since phase one changes `pixelformat` briefly
-behind the driver's back.
-
-```sh
-MV_TOOLS=~/raspberrypi_v4l2/mv_tools_rpi ./test_lut_path.sh 4 /dev/video8 2400 2064
+```
+mipimvsrc device=/dev/video8 i2c-bus=-2 cam-curve=true \
+    format=GRAY8 trans=gamma gamma=0.7 black-level=199 \
+    cam-auto-exposure=0 cam-auto-gain=0 exposure=40000 gain=30 \
+    width=2400 height=2064 framerate=25/1 stamps=driver buffers=10 ! ...
 ```
 
-One piece of evidence suggests the ISP is not bypassed for raw output: the camera's native Mono8 is not
-a plain truncation of its Mono12, measuring a ratio of 18.84 where rounding alone would give 16.
+with the camera configured for Mono8 rather than RAW12:
+
+```sh
+rpi5_scripts/media_setting_rpi5.sh mvcam -fmt RAW8 -x 344 -y 0 -w 2400 -h 2064 -c 1
+```
+
+Two things to get right. **`format` must be `GRAY8`**, or the host unpacks and curves the frame a
+second time - the element says so loudly rather than letting it happen quietly. And uploading the curve
+turns the camera's internal gamma off, so do not also set `cam-gamma`; the uploaded table is the curve.
+
+The table is scaled to `255*(count/256)`, which is 4080 rather than 4095, because the rounding divides
+by 16 and `4095/16` is 255.94 - filling the table to its maximum leaves every value a level high.
+At 4080 the camera's Mono8 byte matches what this element would have produced, median difference 0.
+
+`test_lut_path.sh` is what established all of this, and re-running it is the way to check a different
+camera model before trusting any of it.
 
 ## Use with RMS
 

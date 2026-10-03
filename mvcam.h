@@ -87,6 +87,10 @@ enum MvReg {
     MV_AG_MAX_GAIN       = 0x0c24,   /* dB x 10 */
     MV_CUR_GAIN          = 0x0c28,   /* read only, dB x 10 */
     MV_GAMMA             = 0x0c60,   /* gamma x 100 */
+    MV_LUT_COUNT         = 0x0c74,   /* read only: how many entries the camera wants, 1024 or 4096 */
+    MV_LUT_START         = 0x0c78,   /* write 1 to begin a transfer */
+    MV_LUT_DONE          = 0x0c7c,   /* write 1 to commit it */
+    MV_LUT_DATA          = 0x1800,   /* 0x1800-0x37ff, two 16 bit entries per 32 bit register */
     /* Named DPC_Count in the vendor's driver header, but absent from their published register map and
        read by nothing they ship, so what it actually counts is unverified. */
     MV_DPC_COUNT         = 0x0c6c,
@@ -185,6 +189,17 @@ public:
     bool set_lut_enable(int on);
     bool get_isp_bit(int bit, int *on);
     bool set_blc_mode(int mode, int *actual);
+
+    /* The user LUT. The camera reports the size it wants in MV_LUT_COUNT and it is read-only, so ask
+       before building anything. Measured on an IMX178M: 4096 entries in both Mono12 and Mono8, 1024 in
+       Mono10 - so the table works on the sensor's 12 bit values, before the logic unit rounds them down
+       to the output format. That is what makes it useful: the curve can be applied here and the camera
+       asked for Mono8, with nothing left for the host to do.
+
+       values are 0..count-1. Transfer is START, then the data, then DONE, following the vendor's
+       lut_rw.c exactly. */
+    bool lut_count(uint32_t *count);
+    bool upload_lut(const uint16_t *values, int count);
     bool set_image_direction(int dir);
     bool set_test_image(int which);
     bool set_acquisition(int on);

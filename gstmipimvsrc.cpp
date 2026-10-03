@@ -149,6 +149,7 @@ typedef struct _GstMipiMvSrc {
     gint cam_auto_gain;
     gint cam_lut;
     gint cam_blc;
+    gboolean cam_curve;
 
     /* Baseline of the camera's own frame counters, taken at start. The difference at stop says whether
        the camera dropped frames before the host ever saw them, which looks identical to a host problem
@@ -199,6 +200,7 @@ enum {
     PROP_CAM_AUTO_GAIN,
     PROP_CAM_LUT,
     PROP_CAM_BLC,
+    PROP_CAM_CURVE,
     PROP_TEMPERATURE
 };
 
@@ -358,6 +360,9 @@ static void gst_mipimv_src_set_property(GObject *object, guint prop_id,
             src->cam_blc = g_value_get_int(value);
             mv_apply_live(src, prop_id);
             break;
+        case PROP_CAM_CURVE:
+            src->cam_curve = g_value_get_boolean(value);
+            break;
 
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -475,6 +480,9 @@ static void gst_mipimv_src_get_property(GObject *object, guint prop_id,
         case PROP_CAM_BLC:
             g_value_set_int(value, src->cam_blc);
             break;
+        case PROP_CAM_CURVE:
+            g_value_set_boolean(value, src->cam_curve);
+            break;
         case PROP_TEMPERATURE: {
             /* Read on demand, so a long run can be correlated with sensor temperature. Dark current
                moves with it, and so does the amplitude of the hot pixel pattern. */
@@ -544,7 +552,10 @@ static float normalise_input(int i, int lut_size, int black)
 
    Only the two branches around the symmetry point are needed: the outer ones apply below LP and above
    HP, which are fixed at 0 and 1 here, so they never cover any input. */
-static void build_ghs_lut(unsigned char *lut, int lut_size, float B, float D, float SP, int black)
+/* Fills out[0..lut_size-1] with the curve as normalised 0..1 values. The 8 bit table this element
+   applies and the 12 bit table uploaded into the camera are both scalings of this one array, so there
+   is no second copy of the formula to drift out of step. */
+static void build_ghs_curve(float *out, int lut_size, float B, float D, float SP, int black)
 {
     const float LP = 0.0f, HP = 1.0f;
 
@@ -555,7 +566,7 @@ static void build_ghs_lut(unsigned char *lut, int lut_size, float B, float D, fl
         g_warning("mipimvsrc: GHS parameters degenerate (b=%.3f d=%.3f), falling back to linear", -B, D);
         int div = lut_size/256;
         for (int i = 0; i < lut_size; i++)
-            lut[i] = (unsigned char)(i/(div > 0 ? div : 1));
+            out[i] = (float)(i/(div > 0 ? div : 1))/255.0f;
         return;
     }
 
@@ -568,7 +579,7 @@ static void build_ghs_lut(unsigned char *lut, int lut_size, float B, float D, fl
         g_warning("mipimvsrc: GHS curve is degenerate, falling back to linear");
         int div = lut_size/256;
         for (int i = 0; i < lut_size; i++)
-            lut[i] = (unsigned char)(i/(div > 0 ? div : 1));
+            out[i] = (float)(i/(div > 0 ? div : 1))/255.0f;
         return;
     }
 
@@ -598,8 +609,21 @@ static void build_ghs_lut(unsigned char *lut, int lut_size, float B, float D, fl
         if (!std::isfinite(y))
             y = 0.0f;
 
-        lut[i] = (unsigned char)lrintf(255.0f*CLAMP(y, 0.0f, 1.0f));
+        out[i] = CLAMP(y, 0.0f, 1.0f);
     }
+}
+
+
+/* The 8 bit table this element applies while mapping down to GRAY8. */
+static void build_ghs_lut(unsigned char *lut, int lut_size, float B, float D, float SP, int black)
+{
+    float *curve = g_new(float, lut_size);
+    build_ghs_curve(curve, lut_size, B, D, SP, black);
+
+    for (int i = 0; i < lut_size; i++)
+        lut[i] = (unsigned char)lrintf(255.0f*curve[i]);
+
+    g_free(curve);
 }
 
 
@@ -761,6 +785,93 @@ static void mv_log_probe(MvCam *cam)
         g_print("camera: now exposing %d us at %.1f dB\n", us, db);
 }
 
+/* Builds this element's transfer curve at the camera's own LUT resolution and uploads it, so the camera
+   applies it and the host does not have to.
+
+   Measured on an IMX178M: the LUT is 4096 entries in Mono12 AND in Mono8, 1024 in Mono10, which places
+   it before the logic unit that rounds 12 bit sensor values down to the output format. Confirmed on real
+   data: with a gamma 0.5 table loaded, a population sitting at 199 came back at 903, and
+   4095*(199/4095)^0.5 is 903.
+
+   The point is the combination with Mono8 output: the camera then hands over exactly what convertRows
+   would have produced, so the unpacking and the table lookup disappear and the MIPI payload halves. */
+static gboolean mv_upload_curve(GstMipiMvSrc *src, float B, float D, float SP)
+{
+    uint32_t count = 0;
+    if (!src->i2c->lut_count(&count) || count < 2 || count > 65536) {
+        g_printerr("camera: LUT size came back as %u, not uploading a curve\n", count);
+        return FALSE;
+    }
+
+    /* The camera reports the size; it is read-only, so the curve is built to fit rather than chosen.
+
+       The top of the range is 255*(count/256), not count-1. The logic unit rounds the table's output
+       down to 8 bits by dividing by count/256, and 4095/16 is 255.94, so filling the table to its
+       absolute maximum leaves every value a level high. Scaling to 4080 instead makes the camera's
+       Mono8 output identical to the byte this element would have produced: measured median difference
+       0 against max 1 either way, under both rounding and truncation. */
+    float out_max;
+    if (count >= 256 && count % 256 == 0)
+        out_max = 255.0f*(float)(count/256);
+    else
+        out_max = (float)(count - 1);   /* not a shape we have seen; keep it sane */
+    guint16 *tbl = g_new(guint16, count);
+
+    if (src->trans == TRANS_GHS) {
+
+        float *curve = g_new(float, count);
+        build_ghs_curve(curve, (int)count, B, D, SP, src->black_level);
+        for (uint32_t i = 0; i < count; i++)
+            tbl[i] = (guint16)lrintf(out_max*curve[i]);
+        g_free(curve);
+
+    } else if (src->trans == TRANS_GAMMA) {
+
+        for (uint32_t i = 0; i < count; i++) {
+            float x = normalise_input((int)i, (int)count, src->black_level);
+            tbl[i] = (guint16)lrintf(out_max*powf(x, src->gamma));
+        }
+
+    } else if (src->trans == TRANS_LSB) {
+
+        /* Keep the bottom 8 bits at full resolution and clip, scaled into the output range. */
+        for (uint32_t i = 0; i < count; i++)
+            tbl[i] = (guint16)lrintf(out_max*(float)MIN(i, 255u)/255.0f);
+
+    } else {
+
+        /* Linear is what the camera already does, so there would be nothing to upload. */
+        g_printerr("camera: trans=lin is what the camera does anyway, not uploading a curve\n");
+        g_free(tbl);
+        return FALSE;
+    }
+
+    gboolean ok = src->i2c->upload_lut(tbl, (int)count);
+    g_free(tbl);
+
+    if (!ok) {
+        g_printerr("camera: LUT upload failed: %s\n", src->i2c->error().c_str());
+        return FALSE;
+    }
+
+    /* Two curves in series would be applied twice, so make sure the camera's own gamma is out of the
+       way, then switch the table on. */
+    src->i2c->set_gamma_enable(0);
+    src->i2c->set_lut_enable(1);
+
+    g_print("camera: uploaded a %u entry %s curve and enabled it\n", count,
+            (src->trans == TRANS_GHS) ? "GHS" : (src->trans == TRANS_GAMMA) ? "gamma" : "lsb");
+
+    /* With the curve in the camera the host must not apply a second one. GRAY8 input with trans=lin is
+       the pass-through case; anything else means the frame gets curved twice. */
+    if (src->format != FORMAT_GRAY8)
+        g_printerr("camera: format=%s still unpacks and curves on the host, so the curve is applied "
+                   "TWICE. Set the camera to Mono8 in media_setting_rpi5.sh and use format=GRAY8.\n",
+                   (src->format == FORMAT_Y10P) ? "Y10P" : "Y12P");
+
+    return TRUE;
+}
+
 /* Everything that has to be in place before the V4L2 device is opened. Returns FALSE only for a
    failure that would leave the stream misconfigured; a control that merely could not be written is
    logged and does not stop the pipeline. */
@@ -783,6 +894,7 @@ static gboolean mv_setup_camera(GstMipiMvSrc *src)
         if (src->cam_auto_gain >= 0)     g_string_append(ignored, " cam-auto-gain");
         if (src->cam_lut >= 0)           g_string_append(ignored, " cam-lut");
         if (src->cam_blc >= 0)           g_string_append(ignored, " cam-blc");
+        if (src->cam_curve)              g_string_append(ignored, " cam-curve");
         if (src->probe)                  g_string_append(ignored, " probe");
 
         if (ignored->len)
@@ -883,6 +995,11 @@ static gboolean mv_setup_camera(GstMipiMvSrc *src)
     mv_apply_live(src, PROP_CAM_TESTIMG);
     mv_apply_live(src, PROP_CAM_LUT);
     mv_apply_live(src, PROP_CAM_BLC);
+
+    /* After the other controls: uploading the curve turns the camera's own gamma off, so it must not be
+       re-enabled afterwards by cam-gamma. */
+    if (src->cam_curve)
+        mv_upload_curve(src, src->ghs_b, src->ghs_d, src->ghs_sp);
 
     src->fc_valid = src->i2c->frame_counts(&src->fc_sensor0, &src->fc_out0);
 
@@ -1604,6 +1721,17 @@ static void gst_mipimv_src_class_init(GstMipiMvSrcClass *klass)
             "the default helps depends on the sensor; read it back with probe=true first.",
             -1, 255, -1, G_PARAM_READWRITE));
 
+    g_object_class_install_property(gobject_class, PROP_CAM_CURVE,
+        g_param_spec_boolean("cam-curve", "Move the curve into the camera",
+            "Build this element's transfer curve - from trans, gamma, black-level and the ghs-* "
+            "parameters - at the camera's own LUT resolution, upload it, and let the camera apply it. "
+            "The LUT works on the sensor's 12 bit values before they are rounded to the output format, "
+            "so with the camera set to Mono8 and format=GRAY8 the frame arrives already curved: no "
+            "unpacking, no table lookup, and half the MIPI payload. Set trans and gamma as usual; they "
+            "describe the curve either way. Says so loudly if format is not GRAY8, because then the "
+            "host curves the frame a second time.",
+            FALSE, G_PARAM_READWRITE));
+
     g_object_class_install_property(gobject_class, PROP_TEMPERATURE,
         g_param_spec_double("temperature", "Sensor temperature",
             "Sensor temperature in degrees Celsius, read from the camera on each get. -1000 when "
@@ -1675,6 +1803,7 @@ static void gst_mipimv_src_init(GstMipiMvSrc *src)
     src->cam_auto_gain = -1;
     src->cam_lut = -1;
     src->cam_blc = -1;
+    src->cam_curve = FALSE;
     src->fc_valid = FALSE;
 
     gst_base_src_set_live(GST_BASE_SRC(src), TRUE);

@@ -434,6 +434,27 @@ static bool isp_set_bit(MvCam *cam, int bit, int on)
     return cam->write32(MV_ISP_MODULE_CTRL, nv);
 }
 
+bool MvCam::lut_count(uint32_t *count)
+{
+    return read32(MV_LUT_COUNT, count);
+}
+
+bool MvCam::upload_lut(const uint16_t *values, int count)
+{
+    if (!write32(MV_LUT_START, 1))
+        return false;
+
+    /* Two entries per register, low half first, exactly as the vendor's lut_rw.c packs them. */
+    for (int i = 0; i < count; i += 2) {
+        uint32_t lo = values[i];
+        uint32_t hi = (i + 1 < count) ? values[i + 1] : 0;
+        if (!write32((uint16_t)(MV_LUT_DATA + i*2), lo | (hi << 16)))
+            return false;
+    }
+
+    return write32(MV_LUT_DONE, 1);
+}
+
 bool MvCam::set_gamma_enable(int on) { return isp_set_bit(this, MV_ISP_BIT_GAMMA, on); }
 bool MvCam::set_dpc_enable(int on)   { return isp_set_bit(this, MV_ISP_BIT_DPC, on); }
 bool MvCam::set_lut_enable(int on)   { return isp_set_bit(this, MV_ISP_BIT_LUT, on); }
