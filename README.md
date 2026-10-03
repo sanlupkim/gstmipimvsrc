@@ -355,6 +355,36 @@ pixels standing more than 8 levels above their surroundings, and masking them cu
 were not stars by 58 to 80%. Whether `cam-dpc=1` covers any of those is worth testing empirically:
 enable it, collect a night, rebuild the fixed pattern and compare the count.
 
+### Could the curve move into the camera?
+
+The camera has a user LUT: 4096 entries, 12 bit in, 12 bit out. The vendor's own samples are exactly
+`4095*(i/4095)^gamma`, matching to 1 ADU, so it is the same shape of curve this element applies in
+`convertRows`. Moving it into the camera would be worth a lot:
+
+- the unpacking and table lookup disappear, which is 2.4 ms per frame on the `lin` fast path and 5.7 ms
+  with a curve, single threaded at 2400x2064
+- asking for `RAW8` output halves the MIPI payload, 186 MB/s down to 124 MB/s per camera at 25 fps
+- and the tonal spread would be ours rather than the camera's own 8 bit curve, which on this sensor put
+  the whole sky inside about 5 output levels
+
+**It hinges on one unknown: whether the camera's ISP is in the RAW output path at all.** Many ISPs
+bypass their processing blocks for raw output, in which case the LUT only touches processed formats and
+the host has to keep doing the work. There is one piece of evidence that it is not bypassed - the
+camera's native RAW8 is not a plain truncation of its RAW12, measuring a ratio of 18.84 where a
+truncation would give 16 - so something non-linear is already happening in that path.
+
+`test_lut_path.sh` settles it. It uploads a gamma 0.5 curve, which is unmistakable (a pixel at 1024
+becomes 2048, one at 256 becomes 1024), captures before and after, compares, and restores the camera.
+Nothing is written to flash.
+
+```sh
+./test_lut_path.sh 4 /dev/video8 2400 2064
+```
+
+If the LUT turns out to be in the RAW path, the next question is whether `pixelformat=RAW8` then gives
+the top 8 bits of the LUT output, which would make the element a `memcpy`. Until that is measured there
+is nothing here to implement.
+
 ## Use with RMS
 
 RMS parses the device string itself when it names its sink `name=appsink`, rather than handing it to
