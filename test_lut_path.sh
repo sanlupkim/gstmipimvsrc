@@ -26,6 +26,17 @@ cd "$MV" || { echo "Set MV_TOOLS to the mv_tools_rpi directory"; exit 1; }
 
 i2c() { ./mv_mipi_i2c.sh "$@" -b "$BUS" 2>&1 | grep -v "^Executing:"; }
 
+grab() {
+    v4l2-ctl -d "$VIDEO" --set-fmt-video=width=$W,height=$H \
+             --stream-mmap --stream-count=3 --stream-to="$1" >/dev/null 2>&1
+    if [ -s "$1" ]; then
+        ls -l "$1" | awk '{print "    captured", $5, "bytes"}'
+    else
+        echo "    capture FAILED - is $VIDEO right, and is RMS stopped?"
+        return 1
+    fi
+}
+
 echo "=== state before ==="
 i2c -r -f lutenable
 i2c -r -f gammaenable
@@ -35,6 +46,21 @@ i2c -r -f blacklevel
 WAS_LUT=$(i2c -r -f lutenable | grep -oE '[0-9]+$')
 WAS_FMT=$(i2c -r -f pixelformat | grep -oE '[0-9]+$')
 echo "(will restore lutenable=${WAS_LUT:-0} pixelformat=${WAS_FMT:-2})"
+
+# Phase 1 changes pixelformat behind the driver's back, so make sure an interrupt does not leave it
+# that way. Restoring twice is harmless.
+restore() {
+    echo
+    echo "=== restoring ==="
+    ./lut_rw "$BUS" 0x3b w lut_samples/lut_linear.txt >/dev/null 2>&1 \
+        && echo "    LUT reset to linear"
+    i2c -w -f lutenable -p1 "${WAS_LUT:-0}" >/dev/null
+    i2c -w -f pixelformat -p1 "${WAS_FMT:-2}" >/dev/null
+    i2c -r -f lutenable
+    i2c -r -f pixelformat
+    echo "    nothing was written to flash, so a power cycle also clears this"
+}
+trap restore EXIT INT TERM
 
 # --- Phase 1: what domain does the LUT live in? One I2C read per format, no capture needed.
 #
@@ -87,7 +113,7 @@ import sys
 vals = [round(4095*(i/4095)**0.5) for i in range(4096)]
 open(sys.argv[1], 'w').write(','.join(str(v) for v in vals))
 PY
-./lut_rw "$BUS" 0x3b w "$OUT/g05.txt" && echo "    LUT uploaded"
+./lut_rw "$BUS" 0x3b w "$OUT/g05.txt" >/dev/null 2>&1 && echo "    LUT uploaded"
 i2c -w -f lutenable -p1 1 >/dev/null
 i2c -r -f lutenable
 
@@ -146,9 +172,4 @@ else:
 PY
 
 echo
-echo "=== restoring ==="
-./lut_rw "$BUS" 0x3b w lut_samples/lut_linear.txt >/dev/null 2>&1 && echo "    LUT reset to linear"
-i2c -w -f lutenable -p1 "${WAS_LUT:-0}" >/dev/null
-i2c -r -f lutenable
-echo "    nothing was written to flash, so a power cycle also clears this"
 echo "    captures left in $OUT"
