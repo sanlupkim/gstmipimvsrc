@@ -331,13 +331,29 @@ something else, so `cam-lut=0` is cheap insurance.
 Worth logging: measurements on an IMX178 found the hot pixel pattern's amplitude moving from 27 to 43
 ADU across nights while the sky stayed put, which was temperature rather than anything in the sky.
 
-### Defect pixel correction
+### Defect pixel correction, and why you cannot load your own map
 
-`cam-dpc=1` has the camera correct its own defective pixels, and `probe=true` reports how many are in
-its table. On a sensor with a lot of hot pixels this is worth trying: it removes them before they ever
-reach the host, which is cheaper than masking them afterwards. Measurements on an IMX178 with this
-lens found about 1700 pixels standing more than 8 levels above their surroundings, and masking them
-cut the detections that were not stars by 58 to 80%.
+`cam-dpc=1` turns on whatever correction the camera has. That is the whole interface: the vendor's
+[register map](https://wiki.veye.cc/index.php/MV_Series_MIPI_Camera_Register_Map) documents DPC as a
+single bit (bit 4 of ISP module ctrl, 0x0C00) and nothing else.
+
+**There is no way to upload a defect pixel list.** No such register exists in the published map, in the
+driver header, or in the vendor's tools. The camera's own manual does not mention DPC at all.
+
+Three registers named `DPC_Start` (0xC64), `DPC_Status` (0xC68) and `DPC_Count` (0xC6C) do appear in
+every version of the vendor's driver header, which suggests the camera can run its own detection pass -
+but they are absent from the published register map, no code they ship touches them, and nothing
+describes what values they take. `probe=true` prints 0xC6C as a raw register value for that reason,
+rather than calling it a pixel count.
+
+The LUT is not an alternative. It is a tone curve - `LUT Count` (0x0C74) is 1024 or 4096 entries, with
+the data at 0x1800-0x37FF - so it maps an intensity to an intensity, identically for every pixel. The
+samples the vendor ships are gamma 0.8, gamma 1.2 and linear.
+
+So the hot pixel map stays on the host. Measurements on an IMX178 with this lens found about 1700
+pixels standing more than 8 levels above their surroundings, and masking them cut the detections that
+were not stars by 58 to 80%. Whether `cam-dpc=1` covers any of those is worth testing empirically:
+enable it, collect a night, rebuild the fixed pattern and compare the count.
 
 ## Use with RMS
 

@@ -728,11 +728,16 @@ static void mv_log_probe(MvCam *cam)
     if (cam->temperature_c(&t))
         g_print("camera: sensor temperature %.1f C\n", t);
 
-    uint32_t dpc = 0;
     int bit = 0;
-    if (cam->dpc_count(&dpc) && cam->get_isp_bit(MV_ISP_BIT_DPC, &bit))
-        g_print("camera: defect pixel correction %s, %u pixels in its table\n",
-                bit ? "on" : "off", dpc);
+    if (cam->get_isp_bit(MV_ISP_BIT_DPC, &bit))
+        g_print("camera: defect pixel correction %s\n", bit ? "on" : "off");
+
+    /* 0xC6C is named DPC_Count in the vendor's driver header but does not appear in their published
+       register map and nothing they ship reads it, so what it counts is a guess. Printed as a raw
+       register value rather than dressed up as a pixel count. */
+    uint32_t dpc = 0;
+    if (cam->dpc_count(&dpc))
+        g_print("camera: register 0xC6C (DPC_Count in the vendor header, undocumented) = %u\n", dpc);
 
     /* A user LUT left enabled quietly rewrites every pixel on top of gamma, which is close to
        undiagnosable from the host side, so it is worth saying out loud. */

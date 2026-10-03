@@ -87,7 +87,9 @@ enum MvReg {
     MV_AG_MAX_GAIN       = 0x0c24,   /* dB x 10 */
     MV_CUR_GAIN          = 0x0c28,   /* read only, dB x 10 */
     MV_GAMMA             = 0x0c60,   /* gamma x 100 */
-    MV_DPC_COUNT         = 0x0c6c,   /* read only, defect pixels the camera is correcting */
+    /* Named DPC_Count in the vendor's driver header, but absent from their published register map and
+       read by nothing they ship, so what it actually counts is unverified. */
+    MV_DPC_COUNT         = 0x0c6c,
     MV_MAX_EXP_TIME      = 0x0c8c,   /* read only, microseconds */
     MV_MIN_EXP_TIME      = 0x0c90,   /* read only, units of 0.1 microseconds */
 };
