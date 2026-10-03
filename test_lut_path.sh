@@ -33,16 +33,49 @@ i2c -r -f pixelformat
 i2c -r -f blacklevel
 
 WAS_LUT=$(i2c -r -f lutenable | grep -oE '[0-9]+$')
-echo "(will restore lutenable to ${WAS_LUT:-0})"
+WAS_FMT=$(i2c -r -f pixelformat | grep -oE '[0-9]+$')
+echo "(will restore lutenable=${WAS_LUT:-0} pixelformat=${WAS_FMT:-2})"
 
-grab() {
-    v4l2-ctl -d "$VIDEO" --set-fmt-video=width=$W,height=$H \
-             --stream-mmap --stream-count=3 --stream-to="$1" >/dev/null 2>&1
-    ls -l "$1" | awk '{print "    captured", $5, "bytes ->", $9}'
-}
+# --- Phase 1: what domain does the LUT live in? One I2C read per format, no capture needed.
+#
+# The documentation says the sensor is always 12 bit and "the logic unit performs data rounding to
+# achieve a different pixel format", so the question is whether the LUT sits before that rounding or
+# after it. LUT Count (0xC74) is read-only and the camera reports what it wants:
+#
+#   stays 4096 in Mono8  -> the LUT works on 12 bit values, before the rounding. This is the useful
+#                           case: upload our gamma, ask for Mono8, and the camera hands back exactly
+#                           what convertRows would have produced.
+#   becomes 256 in Mono8 -> the LUT is applied after the reduction, on values that have already lost
+#                           the faint end. Useless for us.
+#   stays 0 or errors    -> no LUT in that mode at all.
+#
+# Run this with RMS stopped: it changes pixelformat briefly behind the driver's back.
+echo
+echo "=== phase 1: LUT size per pixel format (0xC74, read only) ==="
+printf '%-10s %-14s %s\n' "format" "LUT entries" "meaning"
+for FMT in 2 1 0; do
+    NAME=$(case $FMT in 0) echo Mono8;; 1) echo Mono10;; 2) echo Mono12;; esac)
+    i2c -w -f pixelformat -p1 $FMT >/dev/null
+    sleep 0.3
+    CNT=$(./i2c_4read "$BUS" 0x3b 0xC74 2>/dev/null | tr -d ' ')
+    case "$CNT" in
+        4096) M="12 bit domain" ;;
+        1024) M="10 bit domain" ;;
+        256)  M="8 bit domain - after the rounding, no use to us" ;;
+        0|"") M="no LUT reported" ;;
+        *)    M="unexpected" ;;
+    esac
+    printf '%-10s %-14s %s\n' "$NAME" "${CNT:-?}" "$M"
+done
+
+i2c -w -f pixelformat -p1 "${WAS_FMT:-2}" >/dev/null
+echo "(pixelformat restored to ${WAS_FMT:-2})"
+echo
+echo "If Mono8 reported 4096, the curve can move into the camera and the element becomes a memcpy."
+echo "Phase 2 below confirms the LUT actually reaches the RAW data at all."
 
 echo
-echo "=== capture with the LUT off ==="
+echo "=== phase 2: does the LUT reach RAW data? capture with it off ==="
 i2c -w -f lutenable -p1 0 >/dev/null
 grab "$OUT/before.raw"
 

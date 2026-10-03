@@ -367,23 +367,38 @@ The camera has a user LUT: 4096 entries, 12 bit in, 12 bit out. The vendor's own
 - and the tonal spread would be ours rather than the camera's own 8 bit curve, which on this sensor put
   the whole sky inside about 5 output levels
 
-**It hinges on one unknown: whether the camera's ISP is in the RAW output path at all.** Many ISPs
-bypass their processing blocks for raw output, in which case the LUT only touches processed formats and
-the host has to keep doing the work. There is one piece of evidence that it is not bypassed - the
-camera's native RAW8 is not a plain truncation of its RAW12, measuring a ratio of 18.84 where a
-truncation would give 16 - so something non-linear is already happening in that path.
+**The LUT does not change the output format.** It is 12 bit in, 12 bit out; with `pixelformat` set to
+Mono12 you still get Mono12. Eight bit output comes from `pixelformat=0` (Mono8), and the vendor's guide
+describes how: *"the AD bits of the sensor is always 12 bits, and the logic unit performs data rounding
+to achieve a different pixel format"*. So the whole idea rests on **where the LUT sits relative to that
+rounding**.
 
-`test_lut_path.sh` settles it. It uploads a gamma 0.5 curve, which is unmistakable (a pixel at 1024
-becomes 2048, one at 256 becomes 1024), captures before and after, compares, and restores the camera.
-Nothing is written to flash.
+If it is before, uploading our gamma and asking for Mono8 gives back exactly what `convertRows` would
+have produced, for free. If it is after, the LUT only reshapes values that have already lost the faint
+end, which is no use.
+
+`LUT Count` (0xC74) answers it with one read per format, because it is read-only and the camera reports
+how many entries it wants - `lut_rw` reads it before sending anything. The vendor ships samples in two
+sizes, `10bitdepth` (1024) and `12bitdepth` (4096), so it tracks a bit depth:
+
+| what Mono8 reports | what it means |
+|---|---|
+| 4096 | the LUT works on 12 bit values, before the rounding - the idea works |
+| 256 | the LUT is applied after the reduction - no use |
+| nothing | no LUT in that mode |
+
+`test_lut_path.sh` reads that first, then confirms separately that the LUT reaches RAW data at all by
+uploading a gamma 0.5 curve, which is unmistakable - a pixel at 1024 becomes 2048, one at 256 becomes
+1024 - capturing before and after and comparing. It restores the LUT, the enable bit and the pixel
+format, and writes no flash. Run it with RMS stopped, since phase one changes `pixelformat` briefly
+behind the driver's back.
 
 ```sh
-./test_lut_path.sh 4 /dev/video8 2400 2064
+MV_TOOLS=~/raspberrypi_v4l2/mv_tools_rpi ./test_lut_path.sh 4 /dev/video8 2400 2064
 ```
 
-If the LUT turns out to be in the RAW path, the next question is whether `pixelformat=RAW8` then gives
-the top 8 bits of the LUT output, which would make the element a `memcpy`. Until that is measured there
-is nothing here to implement.
+One piece of evidence suggests the ISP is not bypassed for raw output: the camera's native Mono8 is not
+a plain truncation of its Mono12, measuring a ratio of 18.84 where rounding alone would give 16.
 
 ## Use with RMS
 
