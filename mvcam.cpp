@@ -466,27 +466,30 @@ bool MvCam::upload_lut(const uint16_t *values, int count)
         return false;
     usleep(1000);
 
-    /* Read a few entries back. A table that was sent too fast, or to the wrong addresses, otherwise
-       announces itself only as a strangely dark image hours later - which is exactly how the missing
-       delays above were found. Eight samples across the range is enough to catch a transfer that went
-       wrong without adding meaningful time. */
+    /* Read a few entries back, because a table that was sent too fast otherwise announces itself only
+       as a strangely dark image hours later.
+
+       Writing and reading are not symmetric, which is easy to get wrong: a write at MV_LUT_DATA + i*2
+       carries entries i and i+1 packed into one 32 bit register, but a READ of the same address returns
+       entry i alone in the low half, with the high half zero. The vendor's reader shows this - it walks
+       its index by one, not by two, and keeps only the low word. Comparing against the packed pair
+       rejects a perfectly good upload. */
     int bad = 0;
     for (int k = 0; k < 8; k++) {
-        int i = (count/8)*k & ~1;              /* keep it on a written, 4 byte aligned pair */
-        if (i + 1 >= count)
+        int i = (count/8)*k;
+        if (i >= count)
             break;
 
         uint32_t got = 0;
         if (!read32((uint16_t)(MV_LUT_DATA + i*2), &got))
             return false;
 
-        uint32_t want = (uint32_t)values[i] | ((uint32_t)values[i + 1] << 16);
-        if (got != want) {
+        if ((got & 0xffff) != values[i]) {
             if (bad == 0) {
                 char buf[160];
                 snprintf(buf, sizeof(buf),
-                         "LUT did not take: entry %d reads %u,%u but %u,%u was sent",
-                         i, got & 0xffff, got >> 16, want & 0xffff, want >> 16);
+                         "LUT did not take: entry %d reads %u but %u was sent",
+                         i, got & 0xffff, values[i]);
                 error_ = buf;
             }
             bad++;

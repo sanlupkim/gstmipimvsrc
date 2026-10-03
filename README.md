@@ -444,6 +444,12 @@ not optional - sending the table at full speed leaves the camera holding only pa
 as an image crushed to black rather than as any kind of error. Eight entries are read back afterwards
 and a mismatch fails the upload instead of enabling a broken curve.
 
+Writing and reading the table are not symmetric, which is worth knowing before writing any check: a
+write to `LUT_DATA + i*2` carries entries *i* and *i+1* packed into one 32 bit register, but a **read of
+the same address returns entry i alone**, in the low half, with the high half zero. The vendor's reader
+shows this - it walks its index by one where the writer walks by two. Comparing a read against the
+packed pair rejects a perfectly good upload.
+
 `test_lut_path.sh` is what established all of this, and re-running it is the way to check a different
 camera model before trusting any of it.
 
