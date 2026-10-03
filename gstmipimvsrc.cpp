@@ -165,8 +165,6 @@ static void gst_mipimv_src_set_property(GObject *object, guint prop_id,
             const char *trans = g_value_get_string(value);
             if (g_strcmp0(trans, "lin") == 0)
                 src->trans = TRANS_LIN;
-    src->out_format = OUT_GRAY8;
-    src->unlocked = FALSE;
             else if (g_strcmp0(trans, "lsb") == 0)
                 src->trans = TRANS_LSB;
             else if (g_strcmp0(trans, "ghs") == 0)
@@ -1026,6 +1024,8 @@ static void gst_mipimv_src_init(GstMipiMvSrc *src)
     src->fps_d = 1;
     src->format = FORMAT_GRAY8;
     src->trans = TRANS_LIN;
+    src->out_format = OUT_GRAY8;
+    src->unlocked = FALSE;
 
     src->ghs_b = -0.99f;
     src->ghs_d = 70.0f;
