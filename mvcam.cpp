@@ -444,15 +444,56 @@ bool MvCam::upload_lut(const uint16_t *values, int count)
     if (!write32(MV_LUT_START, 1))
         return false;
 
-    /* Two entries per register, low half first, exactly as the vendor's lut_rw.c packs them. */
+    /* The pacing is not optional and it is not conservatism on the vendor's part: their lut_rw.c waits
+       500 ms after the start register and 1 ms after every data write, and without it the camera keeps
+       only part of what was sent. A table uploaded at full speed came back as a curve that crushed the
+       whole image to black. 2048 writes at 1 ms is about two and a half seconds, once, at pipeline
+       start. */
+    usleep(500*1000);
+
+    /* Two entries per register, low half first, address stepping by four bytes - the vendor advances
+       its index twice per iteration and addresses LUT_DATA + i*2. */
     for (int i = 0; i < count; i += 2) {
         uint32_t lo = values[i];
         uint32_t hi = (i + 1 < count) ? values[i + 1] : 0;
         if (!write32((uint16_t)(MV_LUT_DATA + i*2), lo | (hi << 16)))
             return false;
+        usleep(1000);
     }
 
-    return write32(MV_LUT_DONE, 1);
+    usleep(1000);
+    if (!write32(MV_LUT_DONE, 1))
+        return false;
+    usleep(1000);
+
+    /* Read a few entries back. A table that was sent too fast, or to the wrong addresses, otherwise
+       announces itself only as a strangely dark image hours later - which is exactly how the missing
+       delays above were found. Eight samples across the range is enough to catch a transfer that went
+       wrong without adding meaningful time. */
+    int bad = 0;
+    for (int k = 0; k < 8; k++) {
+        int i = (count/8)*k & ~1;              /* keep it on a written, 4 byte aligned pair */
+        if (i + 1 >= count)
+            break;
+
+        uint32_t got = 0;
+        if (!read32((uint16_t)(MV_LUT_DATA + i*2), &got))
+            return false;
+
+        uint32_t want = (uint32_t)values[i] | ((uint32_t)values[i + 1] << 16);
+        if (got != want) {
+            if (bad == 0) {
+                char buf[160];
+                snprintf(buf, sizeof(buf),
+                         "LUT did not take: entry %d reads %u,%u but %u,%u was sent",
+                         i, got & 0xffff, got >> 16, want & 0xffff, want >> 16);
+                error_ = buf;
+            }
+            bad++;
+        }
+    }
+
+    return bad == 0;
 }
 
 bool MvCam::set_gamma_enable(int on) { return isp_set_bit(this, MV_ISP_BIT_GAMMA, on); }

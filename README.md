@@ -438,6 +438,12 @@ The table is scaled to `255*(count/256)`, which is 4080 rather than 4095, becaus
 by 16 and `4095/16` is 255.94 - filling the table to its maximum leaves every value a level high.
 At 4080 the camera's Mono8 byte matches what this element would have produced, median difference 0.
 
+The transfer is paced: 500 ms after the start register and 1 ms after each of the 2048 data writes, so
+about two and a half seconds at pipeline start. That pacing comes from the vendor's `lut_rw.c` and it is
+not optional - sending the table at full speed leaves the camera holding only part of it, which shows up
+as an image crushed to black rather than as any kind of error. Eight entries are read back afterwards
+and a mismatch fails the upload instead of enabling a broken curve.
+
 `test_lut_path.sh` is what established all of this, and re-running it is the way to check a different
 camera model before trusting any of it.
 

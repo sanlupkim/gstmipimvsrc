@@ -847,6 +847,11 @@ static gboolean mv_upload_curve(GstMipiMvSrc *src, float B, float D, float SP)
         return FALSE;
     }
 
+    /* The transfer is paced at 1 ms per register because the camera needs it, so this takes a couple of
+       seconds. Say so, otherwise it looks like the pipeline has hung. */
+    g_print("camera: uploading a %u entry curve, this takes about %.1f s\n",
+            count, 0.5 + 0.001*count/2);
+
     gboolean ok = src->i2c->upload_lut(tbl, (int)count);
     g_free(tbl);
 
