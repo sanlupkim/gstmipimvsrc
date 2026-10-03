@@ -39,8 +39,10 @@ check-deps:
 		echo "  sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libopencv-dev"; \
 		exit 1; }
 
+# $(SRC), not $<: $< is only the first prerequisite, so mvcam.cpp was silently left out and the link
+# failed on every MvCam symbol.
 $(PLUGIN): $(SRC) mvcam.h
-	$(CXX) $(CXXFLAGS) $(PKGFLAGS) $(LDFLAGS) -o $@ $< $(PKGLIBS)
+	$(CXX) $(CXXFLAGS) $(PKGFLAGS) $(LDFLAGS) -o $@ $(SRC) $(PKGLIBS)
 
 install: $(PLUGIN)
 	mkdir -p $(PLUGINDIR)

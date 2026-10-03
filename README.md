@@ -37,6 +37,27 @@ gst-inspect-1.0 mipimvsrc
 Keep `-O3`. Without it the unpacking loop is 3.2x slower, which on a Raspberry Pi 5 is the difference
 between fitting in the frame budget and dropping frames.
 
+### If GStreamer says `no element "mipimvsrc"`
+
+The plugin was not loaded. In order of likelihood:
+
+```sh
+make                      # did the link actually succeed? read the output, do not assume
+make install              # installs and clears the registry cache
+gst-inspect-1.0 mipimvsrc # names the reason if the file is there but unloadable
+```
+
+`gst-inspect-1.0` finding nothing while the file exists usually means it failed to load and has been
+blacklisted. This says why:
+
+```sh
+GST_DEBUG=GST_PLUGIN_LOADING:5 gst-inspect-1.0 mipimvsrc 2>&1 | grep -i mipimv
+gst-inspect-1.0 -b            # lists blacklisted plugins
+```
+
+A plugin can also be shadowed by an older copy: `gst-inspect-1.0 mipimvsrc | grep Filename` says which
+file is actually in use, and `GST_PLUGIN_PATH` can be pointing somewhere else entirely.
+
 ## Properties
 
 | property | default | what it does |
