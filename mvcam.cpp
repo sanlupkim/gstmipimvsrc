@@ -320,6 +320,32 @@ bool MvCam::dpc_count(uint32_t *n)
     return read32(MV_DPC_COUNT, n);
 }
 
+bool MvCam::error_code(uint32_t *code)
+{
+    return read32(MV_ERROR_CODE, code);
+}
+
+bool MvCam::blc_mode(uint32_t *mode)
+{
+    return read32(MV_BLC_MODE, mode);
+}
+
+bool MvCam::frame_counts(uint32_t *sensor, uint32_t *out)
+{
+    return read32(MV_SENSOR_FRAMECOUNT, sensor) && read32(MV_OUT_FRAMECOUNT, out);
+}
+
+bool MvCam::set_blc_mode(int mode, int *actual)
+{
+    if (!write32(MV_BLC_MODE, (uint32_t)mode))
+        return false;
+    uint32_t v;
+    if (!read32(MV_BLC_MODE, &v))
+        return false;
+    *actual = (int)v;
+    return true;
+}
+
 
 
 bool MvCam::get_roi(int *x, int *y, int *w, int *h)
@@ -410,6 +436,7 @@ static bool isp_set_bit(MvCam *cam, int bit, int on)
 
 bool MvCam::set_gamma_enable(int on) { return isp_set_bit(this, MV_ISP_BIT_GAMMA, on); }
 bool MvCam::set_dpc_enable(int on)   { return isp_set_bit(this, MV_ISP_BIT_DPC, on); }
+bool MvCam::set_lut_enable(int on)   { return isp_set_bit(this, MV_ISP_BIT_LUT, on); }
 
 bool MvCam::get_isp_bit(int bit, int *on)
 {

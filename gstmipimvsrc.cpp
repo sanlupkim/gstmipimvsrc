@@ -147,6 +147,15 @@ typedef struct _GstMipiMvSrc {
     gint cam_testimg;
     gint cam_auto_exposure;
     gint cam_auto_gain;
+    gint cam_lut;
+    gint cam_blc;
+
+    /* Baseline of the camera's own frame counters, taken at start. The difference at stop says whether
+       the camera dropped frames before the host ever saw them, which looks identical to a host problem
+       from the outside. */
+    guint32 fc_sensor0;
+    guint32 fc_out0;
+    gboolean fc_valid;
 
 } GstMipiMvSrc;
 
@@ -187,7 +196,10 @@ enum {
     PROP_CAM_IMGDIR,
     PROP_CAM_TESTIMG,
     PROP_CAM_AUTO_EXPOSURE,
-    PROP_CAM_AUTO_GAIN
+    PROP_CAM_AUTO_GAIN,
+    PROP_CAM_LUT,
+    PROP_CAM_BLC,
+    PROP_TEMPERATURE
 };
 
 /* Pushes one live control to the camera if the I2C side is up, so a property set while the pipeline
@@ -338,6 +350,14 @@ static void gst_mipimv_src_set_property(GObject *object, guint prop_id,
             src->cam_auto_gain = g_value_get_int(value);
             mv_apply_live(src, prop_id);
             break;
+        case PROP_CAM_LUT:
+            src->cam_lut = g_value_get_int(value);
+            mv_apply_live(src, prop_id);
+            break;
+        case PROP_CAM_BLC:
+            src->cam_blc = g_value_get_int(value);
+            mv_apply_live(src, prop_id);
+            break;
 
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -449,6 +469,21 @@ static void gst_mipimv_src_get_property(GObject *object, guint prop_id,
         case PROP_CAM_AUTO_GAIN:
             g_value_set_int(value, src->cam_auto_gain);
             break;
+        case PROP_CAM_LUT:
+            g_value_set_int(value, src->cam_lut);
+            break;
+        case PROP_CAM_BLC:
+            g_value_set_int(value, src->cam_blc);
+            break;
+        case PROP_TEMPERATURE: {
+            /* Read on demand, so a long run can be correlated with sensor temperature. Dark current
+               moves with it, and so does the amplitude of the hot pixel pattern. */
+            double t = -1000.0;
+            if (src->i2c && src->i2c->is_open())
+                src->i2c->temperature_c(&t);
+            g_value_set_double(value, t);
+            break;
+        }
 
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -635,6 +670,19 @@ static void mv_apply_live(GstMipiMvSrc *src, guint prop_id)
             if (src->cam_auto_gain >= 0)
                 src->i2c->set_gain_mode(src->cam_auto_gain);
             break;
+        case PROP_CAM_LUT:
+            if (src->cam_lut >= 0) {
+                src->i2c->set_lut_enable(src->cam_lut);
+                g_print("camera: user LUT %s\n", src->cam_lut ? "on" : "off");
+            }
+            break;
+        case PROP_CAM_BLC:
+            if (src->cam_blc >= 0) {
+                int got = 0;
+                if (src->i2c->set_blc_mode(src->cam_blc, &got))
+                    g_print("camera: black level correction mode %d -> %d\n", src->cam_blc, got);
+            }
+            break;
         default:
             break;
     }
@@ -686,6 +734,22 @@ static void mv_log_probe(MvCam *cam)
         g_print("camera: defect pixel correction %s, %u pixels in its table\n",
                 bit ? "on" : "off", dpc);
 
+    /* A user LUT left enabled quietly rewrites every pixel on top of gamma, which is close to
+       undiagnosable from the host side, so it is worth saying out loud. */
+    if (cam->get_isp_bit(MV_ISP_BIT_LUT, &bit))
+        g_print("camera: user LUT %s%s\n", bit ? "ON" : "off",
+                bit ? "  <- this alters pixel values on top of gamma" : "");
+    if (cam->get_isp_bit(MV_ISP_BIT_GAMMA, &bit))
+        g_print("camera: internal gamma %s\n", bit ? "on" : "off");
+
+    uint32_t m = 0;
+    if (cam->blc_mode(&m))
+        g_print("camera: black level correction mode %u\n", m);
+
+    uint32_t err = 0;
+    if (cam->error_code(&err) && err)
+        g_printerr("camera: error code 0x%x\n", err);
+
     int us = 0;
     double db = 0;
     if (cam->get_exposure_us(&us) && cam->get_gain_db(&db))
@@ -712,6 +776,8 @@ static gboolean mv_setup_camera(GstMipiMvSrc *src)
         if (src->cam_testimg >= 0)       g_string_append(ignored, " cam-testimg");
         if (src->cam_auto_exposure >= 0) g_string_append(ignored, " cam-auto-exposure");
         if (src->cam_auto_gain >= 0)     g_string_append(ignored, " cam-auto-gain");
+        if (src->cam_lut >= 0)           g_string_append(ignored, " cam-lut");
+        if (src->cam_blc >= 0)           g_string_append(ignored, " cam-blc");
         if (src->probe)                  g_string_append(ignored, " probe");
 
         if (ignored->len)
@@ -810,6 +876,10 @@ static gboolean mv_setup_camera(GstMipiMvSrc *src)
     mv_apply_live(src, PROP_CAM_DPC);
     mv_apply_live(src, PROP_CAM_IMGDIR);
     mv_apply_live(src, PROP_CAM_TESTIMG);
+    mv_apply_live(src, PROP_CAM_LUT);
+    mv_apply_live(src, PROP_CAM_BLC);
+
+    src->fc_valid = src->i2c->frame_counts(&src->fc_sensor0, &src->fc_out0);
 
     return TRUE;
 }
@@ -947,6 +1017,23 @@ static gboolean gst_mipimv_src_stop(GstBaseSrc *basesrc)
     src->lut = NULL;
 
     if (src->i2c) {
+
+        /* What the camera itself lost. A gap here is not something host-side buffering can fix, and
+           without this it is indistinguishable from the host being too slow. */
+        guint32 sns = 0, out = 0;
+        if (src->fc_valid && src->i2c->frame_counts(&sns, &out)) {
+            guint32 produced = sns - src->fc_sensor0;
+            guint32 sent = out - src->fc_out0;
+            g_print("camera: produced %u frames, sent %u", produced, sent);
+            if (produced > sent)
+                g_print(", DROPPED %u inside the camera", produced - sent);
+            g_print("\n");
+        }
+
+        uint32_t err = 0;
+        if (src->i2c->error_code(&err) && err)
+            g_printerr("camera: error code 0x%x at stop\n", err);
+
         delete src->i2c;
         src->i2c = NULL;
     }
@@ -1499,6 +1586,26 @@ static void gst_mipimv_src_class_init(GstMipiMvSrcClass *klass)
             "same reason as cam-auto-exposure.",
             -1, 2, -1, G_PARAM_READWRITE));
 
+    g_object_class_install_property(gobject_class, PROP_CAM_LUT,
+        g_param_spec_int("cam-lut", "User LUT",
+            "The camera's user lookup table: -1 leave, 0 off, 1 on. Worth setting to 0 on a station "
+            "that cares about photometry - a LUT left enabled rewrites every pixel on top of gamma, "
+            "and nothing on the host side can tell that it happened. probe=true reports its state.",
+            -1, 1, -1, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_CAM_BLC,
+        g_param_spec_int("cam-blc", "Black level correction mode",
+            "Mode of the camera's black level correction, -1 to leave alone. Whether a mode other than "
+            "the default helps depends on the sensor; read it back with probe=true first.",
+            -1, 255, -1, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_TEMPERATURE,
+        g_param_spec_double("temperature", "Sensor temperature",
+            "Sensor temperature in degrees Celsius, read from the camera on each get. -1000 when "
+            "camera control is not active. Read only. Worth logging over a night: dark current and the "
+            "amplitude of the hot pixel pattern both move with it.",
+            -1000.0, 200.0, -1000.0, (GParamFlags)(G_PARAM_READABLE)));
+
     g_object_class_install_property(gobject_class, PROP_THREADS,
         g_param_spec_int("threads", "Threads",
                          "How many threads unpack the frame. The work splits cleanly, so this scales "
@@ -1561,6 +1668,9 @@ static void gst_mipimv_src_init(GstMipiMvSrc *src)
     src->cam_testimg = -1;
     src->cam_auto_exposure = -1;
     src->cam_auto_gain = -1;
+    src->cam_lut = -1;
+    src->cam_blc = -1;
+    src->fc_valid = FALSE;
 
     gst_base_src_set_live(GST_BASE_SRC(src), TRUE);
 }

@@ -57,7 +57,8 @@ enum MvReg {
 
     MV_IMAGE_ACQUISITION = 0x0400,   /* 0 stop, 1 start */
     MV_TRIGGER_MODE      = 0x0404,
-    MV_SENSOR_FRAMECOUNT = 0x0464,
+    MV_SENSOR_FRAMECOUNT = 0x0464,   /* frames the sensor produced */
+    MV_OUT_FRAMECOUNT    = 0x0468,   /* frames the camera sent. The gap is what it dropped itself */
 
     MV_TEST_IMAGE        = 0x0800,
     MV_PIXEL_FORMAT      = 0x0804,   /* 0 raw8, 1 raw10, 2 raw12, 3 raw14, 4 UYVY */
@@ -71,6 +72,7 @@ enum MvReg {
     MV_ROI_OFFSET_Y      = 0x0824,
     MV_IMAGE_DIRECTION   = 0x0828,   /* 0 normal, 1 mirror, 2 flip, 3 both */
     MV_BLACK_LEVEL       = 0x0830,
+    MV_BLC_MODE          = 0x0834,
     MV_MIN_ROI_WIDTH     = 0x0844,
     MV_MIN_ROI_HEIGHT    = 0x0848,
     MV_MIN_FRAMERATE     = 0x084c,   /* fps x 100 */
@@ -147,6 +149,13 @@ public:
     bool min_roi(int *w, int *h);
     bool format_cap(uint32_t *mask);
     bool dpc_count(uint32_t *n);
+    bool error_code(uint32_t *code);
+    bool blc_mode(uint32_t *mode);
+
+    /* Frames the sensor produced against frames it actually sent. A growing gap means the camera is
+       dropping them before the host ever sees them, which no amount of host-side buffering can fix and
+       which otherwise looks exactly like a host problem. */
+    bool frame_counts(uint32_t *sensor, uint32_t *out);
 
     /* NOT provided on purpose: pixel format and ROI.
        The veye_mvcam driver writes Pixel_Format and the ROI registers itself from the media-ctl
@@ -171,7 +180,9 @@ public:
     /* Both live in MV_ISP_MODULE_CTRL, so these are read-modify-write on a shared register. */
     bool set_gamma_enable(int on);
     bool set_dpc_enable(int on);
+    bool set_lut_enable(int on);
     bool get_isp_bit(int bit, int *on);
+    bool set_blc_mode(int mode, int *actual);
     bool set_image_direction(int dir);
     bool set_test_image(int which);
     bool set_acquisition(int on);

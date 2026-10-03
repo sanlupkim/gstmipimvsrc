@@ -73,6 +73,9 @@ These are off unless `i2c-bus` is set, so existing pipelines are unaffected.
 | `cam-dpc` | -1 | Defect pixel correction, 0 off, 1 on |
 | `cam-imgdir` | -1 | 0 normal, 1 mirror, 2 flip, 3 both |
 | `cam-testimg` | -1 | Built-in test pattern |
+| `cam-lut` | -1 | User LUT, 0 off, 1 on. Set 0 if photometry matters |
+| `cam-blc` | -1 | Black level correction mode |
+| `temperature` | — | Sensor temperature in °C, read only |
 
 `-1` everywhere means "leave whatever the camera already has", so you can set one control without
 disturbing the rest.
@@ -293,6 +296,41 @@ anyway: an exposure that moves makes photometry between frames incomparable.
 example above the camera's gamma is left alone and the mapping is done here, because that is the one
 curve RMS can invert.
 
+### Frames the camera dropped by itself
+
+The camera counts frames the sensor produced and frames it actually sent. The element takes both at
+start and reports the difference at stop:
+
+```
+camera: produced 30012 frames, sent 30012
+camera: produced 30012 frames, sent 29987, DROPPED 25 inside the camera
+```
+
+This is worth having because a gap here is invisible from the host: no amount of `buffers`, queue depth
+or thread tuning can recover a frame the camera never sent, and without the counters it looks exactly
+like the host being too slow. If the two numbers match and RMS still reports drops, the problem is on
+this side of the MIPI link.
+
+The camera's error code is read at the same points and printed when it is non-zero.
+
+### A LUT left enabled is worth checking for
+
+`probe=true` reports whether the camera's user lookup table is active:
+
+```
+camera: user LUT ON  <- this alters pixel values on top of gamma
+```
+
+If it is, every pixel has been through an arbitrary curve before the one this element applies, and
+nothing downstream can tell. On a station that does photometry that is a bug waiting to be blamed on
+something else, so `cam-lut=0` is cheap insurance.
+
+### Sensor temperature
+
+`temperature` is read from the camera each time the property is read, so it can be polled during a run.
+Worth logging: measurements on an IMX178 found the hot pixel pattern's amplitude moving from 27 to 43
+ADU across nights while the sky stayed put, which was temperature rather than anything in the sky.
+
 ### Defect pixel correction
 
 `cam-dpc=1` has the camera correct its own defective pixels, and `probe=true` reports how many are in
@@ -335,9 +373,19 @@ gamma: 0.7
 - The driver queue cannot go above 10 buffers, which is OpenCV's limit, not the driver's.
 - Camera control sets only what the driver does not own, so `media_setting_rpi5.sh` is still required
   for format and geometry. The ROI is read back and checked, never written.
-- Trigger mode, the LUT and the auto-exposure ROI are reachable over the same register space but are
-  not exposed. Trigger has working V4L2 controls (`trigger_mode`, `trigger_src`, `soft_trgone`), so it
-  belongs to `v4l2-ctl`, not here.
+- Of what the vendor's `mv_mipi_i2c_new.sh` can reach, these are deliberately not exposed:
+  - **`roi`, `pixelformat`, `readmode`** - the driver owns the frame geometry and format.
+  - **`trgmode`, `trgsrc`, `trgone`** - the driver has working V4L2 controls for these.
+  - **`lanenum`, `clkmode`, `mipidatarate`, `i2caddr`, `i2cport`, `snsreg`** - changing the link
+    configuration or poking raw sensor registers under a bound driver breaks the stream.
+  - **`reboot`, `factoryparam`, `paramsave`** - `paramsave` writes flash, and a property that fires on
+    every pipeline start is the wrong shape for that. Use `mv_mipi_i2c.sh` when you mean it.
+  - **`aatarget`, `aemaxtime`, `agmaxgain`, `aaroi`** - only relevant with auto exposure or gain, which
+    a meteor station should not be using.
+  - **`lut`** (loading a table), **`osdmode`**, **`slavemode`**, the remaining trigger timing, and the
+    GPIO/strobe outputs. Reachable the same way if a use appears; `mvcam.h` is where to add them.
+- `cam-fps` writes the `Framerate` register (hundredths of a frame). The camera also has `FrameRate_Ex`
+  at ten-thousandths, but the driver reads `Framerate`, so that is the one kept in step.
 - No SER or FITS writing. GStreamer has no SER support either, though the format is simple enough
   that a sink would be short work once 16 bit output is being recorded.
 
