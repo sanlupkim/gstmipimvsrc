@@ -811,38 +811,42 @@ static gboolean mv_upload_curve(GstMipiMvSrc *src, float B, float D, float SP)
 
     /* The camera reports the size; it is read-only, so the curve is built to fit rather than chosen.
 
-       The top of the range is 255*(count/256), not count-1. The logic unit rounds the table's output
-       down to 8 bits by dividing by count/256, and 4095/16 is 255.94, so filling the table to its
-       absolute maximum leaves every value a level high. Scaling to 4080 instead makes the camera's
-       Mono8 output identical to the byte this element would have produced: measured median difference
-       0 against max 1 either way, under both rounding and truncation. */
-    float out_max;
-    if (count >= 256 && count % 256 == 0)
-        out_max = 255.0f*(float)(count/256);
-    else
-        out_max = (float)(count - 1);   /* not a shape we have seen; keep it sane */
+       The table does not hold the curve scaled to the top of the range. It holds the MIDDLE of the
+       output bin the value belongs in: step*round(255*x) + step/2, where step is count/256. The reason
+       is that the reduction to 8 bits truncates rather than rounds - the host shift and, as far as can
+       be told, the camera's own rounding to Mono8 - so a table filled with step*255*x lands up to a
+       whole level low. The Moon came out at 254 instead of 255 for exactly that reason: it saturates at
+       4094 rather than 4095, which gave 4079 and truncated to 254.
+
+       With the bin centre baked in, truncation lands on round(255*x) exactly: measured error 0 across
+       the whole table for gamma 0.45, 0.5, 0.7 and 1.0. */
+    int step = (count >= 256 && count % 256 == 0) ? (int)(count/256) : 1;
     guint16 *tbl = g_new(guint16, count);
+
+    /* Maps a normalised curve value to the centre of the output bin it belongs in. */
+    const guint16 top = (guint16)(count - 1);
+    #define BIN_CENTRE(y) ((guint16)MIN((guint)(step*(int)lrintf(255.0f*(y)) + step/2), (guint)top))
 
     if (src->trans == TRANS_GHS) {
 
         float *curve = g_new(float, count);
         build_ghs_curve(curve, (int)count, B, D, SP, src->black_level);
         for (uint32_t i = 0; i < count; i++)
-            tbl[i] = (guint16)lrintf(out_max*curve[i]);
+            tbl[i] = BIN_CENTRE(curve[i]);
         g_free(curve);
 
     } else if (src->trans == TRANS_GAMMA) {
 
         for (uint32_t i = 0; i < count; i++) {
             float x = normalise_input((int)i, (int)count, src->black_level);
-            tbl[i] = (guint16)lrintf(out_max*powf(x, src->gamma));
+            tbl[i] = BIN_CENTRE(powf(x, src->gamma));
         }
 
     } else if (src->trans == TRANS_LSB) {
 
         /* Keep the bottom 8 bits at full resolution and clip, scaled into the output range. */
         for (uint32_t i = 0; i < count; i++)
-            tbl[i] = (guint16)lrintf(out_max*(float)MIN(i, 255u)/255.0f);
+            tbl[i] = BIN_CENTRE((float)MIN(i, 255u)/255.0f);
 
     } else {
 
@@ -856,6 +860,8 @@ static gboolean mv_upload_curve(GstMipiMvSrc *src, float B, float D, float SP)
        seconds. Say so, otherwise it looks like the pipeline has hung. */
     g_print("camera: uploading a %u entry curve, this takes about %.1f s\n",
             count, 0.5 + 0.001*count/2);
+
+    #undef BIN_CENTRE
 
     gboolean ok = src->i2c->upload_lut(tbl, (int)count);
     g_free(tbl);
