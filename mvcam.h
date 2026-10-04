@@ -146,9 +146,20 @@ public:
     bool read32(uint16_t reg, uint32_t *out);
     bool write32(uint16_t reg, uint32_t val);
 
-    /* Identification and capabilities. Strings come back as four packed ASCII bytes. */
-    std::string id_string(uint16_t reg);
+    /* Identification. These are NOT strings, whatever the register names suggest: the manufacturer
+       happens to read as ASCII ("VEYE" is 0x56455945) but the model is a numeric code, the serial is an
+       opaque number and the version packs four bytes as C and L pairs. Decoding them as text produces
+       convincing nonsense, which is how this was found. */
+    bool manufacturer(std::string *out);
+    bool model(std::string *out, uint32_t *code);
+    bool serial(uint32_t *out);
+    bool version(std::string *out);
+
+    /* Several registers are simply absent on some firmware and read back as all ones. Anything built on
+       top of a raw read has to treat that as "no answer" rather than as a value. */
+    static bool implemented(uint32_t v) { return v != 0xffffffffu; }
     bool temperature_c(double *out);
+    bool gamma_value(double *out);
     bool sensor_size(int *w, int *h);
     bool framerate_range(double *min_fps, double *max_fps);
     bool exposure_range_us(double *min_us, double *max_us);

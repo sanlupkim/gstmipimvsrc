@@ -247,24 +247,91 @@ bool MvCam::read32(uint16_t reg, uint32_t *out)
     return true;
 }
 
-std::string MvCam::id_string(uint16_t reg)
+bool MvCam::manufacturer(std::string *out)
 {
     uint32_t v;
-    if (!read32(reg, &v))
-        return std::string();
+    if (!read32(MV_MANUFACTURER, &v))
+        return false;
 
-    /* Four packed ASCII bytes, most significant first. */
-    char s[5] = { (char)(v >> 24), (char)(v >> 16), (char)(v >> 8), (char)v, 0 };
-    for (int i = 0; i < 4; i++)
-        if (s[i] < 0x20 || s[i] > 0x7e)
-            s[i] = ' ';
-    return std::string(s);
+    /* The vendor's own tool compares the whole word against this one constant rather than decoding it. */
+    if (v == 0x56455945u) {
+        *out = "VEYE";
+    } else {
+        char b[32];
+        snprintf(b, sizeof(b), "unknown (0x%08x)", v);
+        *out = b;
+    }
+    return true;
+}
+
+bool MvCam::model(std::string *out, uint32_t *code)
+{
+    uint32_t v;
+    if (!read32(MV_MODEL, &v))
+        return false;
+    *code = v;
+
+    /* Codes from the vendor's read_model. The low half is the sensor number in hex - 376 is 0x178 for
+       the IMX178, 33890 is 0x8462 for the IMX462 - so an unlisted camera still identifies itself. */
+    struct { uint32_t code; const char *name; } known[] = {
+        {   662, "MV-MIPI-IMX296M"   },
+        {   376, "MV-MIPI-IMX178M"   },
+        {   304, "MV-MIPI-SC130M"    },
+        {   613, "MV-MIPI-IMX265M"   },
+        {   612, "MV-MIPI-IMX264M"   },
+        {   647, "MV-MIPI-IMX287M"   },
+        { 33074, "RAW-MIPI-SC132M"   },
+        { 33332, "RAW-MIPI-AR0234M"  },
+        { 33890, "RAW-MIPI-IMX462M"  },
+        { 34101, "RAW-MIPI-SC535M"   },
+        { 16386, "MV-MIPI-GMAX4002M" },
+    };
+
+    for (unsigned i = 0; i < sizeof(known)/sizeof(known[0]); i++) {
+        if (known[i].code == v) {
+            *out = known[i].name;
+            return true;
+        }
+    }
+
+    char b[48];
+    snprintf(b, sizeof(b), "unlisted, code %u (0x%04x)", v, v & 0xffff);
+    *out = b;
+    return true;
+}
+
+bool MvCam::serial(uint32_t *out)
+{
+    return read32(MV_PRODUCT_INFO, out);
+}
+
+bool MvCam::version(std::string *out)
+{
+    uint32_t v;
+    if (!read32(MV_DEVICE_VERSION, &v))
+        return false;
+
+    /* Two version pairs packed into the word, formatted the way the vendor's tool prints them. */
+    char b[48];
+    snprintf(b, sizeof(b), "C %02x.%02x, L %02x.%02x",
+             (v >> 24) & 0xff, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff);
+    *out = b;
+    return true;
+}
+
+bool MvCam::gamma_value(double *out)
+{
+    uint32_t v;
+    if (!read32(MV_GAMMA, &v) || !implemented(v))
+        return false;
+    *out = v/100.0;
+    return true;
 }
 
 bool MvCam::temperature_c(double *out)
 {
     uint32_t v;
-    if (!read32(MV_TEMP_K, &v))
+    if (!read32(MV_TEMP_K, &v) || !implemented(v))
         return false;
     *out = v/100.0 - 273.15;
     return true;
@@ -274,6 +341,8 @@ bool MvCam::sensor_size(int *w, int *h)
 {
     uint32_t a, b;
     if (!read32(MV_SENSOR_WIDTH, &a) || !read32(MV_SENSOR_HEIGHT, &b))
+        return false;
+    if (!implemented(a) || !implemented(b))
         return false;
     *w = (int)a;
     *h = (int)b;
@@ -285,6 +354,8 @@ bool MvCam::framerate_range(double *min_fps, double *max_fps)
     uint32_t a, b;
     if (!read32(MV_MIN_FRAMERATE, &a) || !read32(MV_MAX_FRAMERATE, &b))
         return false;
+    if (!implemented(a) || !implemented(b))
+        return false;
     *min_fps = a/100.0;
     *max_fps = b/100.0;
     return true;
@@ -295,6 +366,8 @@ bool MvCam::exposure_range_us(double *min_us, double *max_us)
     uint32_t a, b;
     if (!read32(MV_MIN_EXP_TIME, &a) || !read32(MV_MAX_EXP_TIME, &b))
         return false;
+    if (!implemented(a) || !implemented(b))
+        return false;
     *min_us = a/10.0;      /* this one is in units of 0.1 us, unlike every other exposure register */
     *max_us = (double)b;
     return true;
@@ -304,6 +377,8 @@ bool MvCam::min_roi(int *w, int *h)
 {
     uint32_t a, b;
     if (!read32(MV_MIN_ROI_WIDTH, &a) || !read32(MV_MIN_ROI_HEIGHT, &b))
+        return false;
+    if (!implemented(a) || !implemented(b))
         return false;
     *w = (int)a;
     *h = (int)b;
@@ -317,7 +392,7 @@ bool MvCam::format_cap(uint32_t *mask)
 
 bool MvCam::dpc_count(uint32_t *n)
 {
-    return read32(MV_DPC_COUNT, n);
+    return read32(MV_DPC_COUNT, n) && implemented(*n);
 }
 
 bool MvCam::error_code(uint32_t *code)

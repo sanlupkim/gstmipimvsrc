@@ -722,10 +722,18 @@ static void mv_apply_live(GstMipiMvSrc *src, guint prop_id)
    sensor's real size and limits without the vendor scripts. */
 static void mv_log_probe(MvCam *cam)
 {
-    g_print("camera: %s %s, sensor %s, serial %s, firmware %s\n",
-            cam->id_string(MV_MANUFACTURER).c_str(), cam->id_string(MV_MODEL).c_str(),
-            cam->id_string(MV_SENSOR_NAME).c_str(), cam->id_string(MV_PRODUCT_INFO).c_str(),
-            cam->id_string(MV_DEVICE_VERSION).c_str());
+    /* Printed field by field, because a register that is absent on this firmware reads back as all
+       ones and must say so rather than be formatted as a number. An earlier version decoded the model,
+       serial and version as ASCII and reported a temperature of 42949399.8 C with complete confidence. */
+    std::string manu, mdl, ver;
+    uint32_t code = 0, ser = 0;
+
+    if (cam->manufacturer(&manu) && cam->model(&mdl, &code))
+        g_print("camera: %s %s\n", manu.c_str(), mdl.c_str());
+    if (cam->serial(&ser))
+        g_print("camera: serial 0x%08x\n", ser);
+    if (cam->version(&ver))
+        g_print("camera: firmware %s\n", ver.c_str());
 
     int w = 0, h = 0;
     if (cam->sensor_size(&w, &h))
@@ -738,15 +746,19 @@ static void mv_log_probe(MvCam *cam)
     double lo = 0, hi = 0;
     if (cam->framerate_range(&lo, &hi))
         g_print("camera: frame rate %.2f..%.2f fps\n", lo, hi);
+    else
+        g_print("camera: frame rate limits not reported by this firmware\n");
+
     if (cam->exposure_range_us(&lo, &hi))
         g_print("camera: exposure %.1f..%.0f us\n", lo, hi);
+    else
+        g_print("camera: exposure limits not reported by this firmware\n");
 
     if (cam->min_roi(&w, &h))
         g_print("camera: smallest ROI %dx%d\n", w, h);
 
     uint32_t mask = 0;
     if (cam->format_cap(&mask)) {
-        /* The capability word is a bitmask over the same order as MvPixelFormat. */
         g_print("camera: formats supported:%s%s%s%s\n",
                 (mask & (1u << MV_FMT_RAW8))  ? " raw8"  : "",
                 (mask & (1u << MV_FMT_RAW10)) ? " raw10" : "",
@@ -757,29 +769,33 @@ static void mv_log_probe(MvCam *cam)
     double t = 0;
     if (cam->temperature_c(&t))
         g_print("camera: sensor temperature %.1f C\n", t);
+    else
+        g_print("camera: sensor temperature not reported by this firmware\n");
 
     int bit = 0;
     if (cam->get_isp_bit(MV_ISP_BIT_DPC, &bit))
         g_print("camera: defect pixel correction %s\n", bit ? "on" : "off");
 
-    /* 0xC6C is named DPC_Count in the vendor's driver header but does not appear in their published
-       register map and nothing they ship reads it, so what it counts is a guess. Printed as a raw
-       register value rather than dressed up as a pixel count. */
     uint32_t dpc = 0;
     if (cam->dpc_count(&dpc))
         g_print("camera: register 0xC6C (DPC_Count in the vendor header, undocumented) = %u\n", dpc);
 
-    /* A user LUT left enabled quietly rewrites every pixel on top of gamma, which is close to
-       undiagnosable from the host side, so it is worth saying out loud. */
     if (cam->get_isp_bit(MV_ISP_BIT_LUT, &bit))
         g_print("camera: user LUT %s%s\n", bit ? "ON" : "off",
                 bit ? "  <- this alters pixel values on top of gamma" : "");
-    if (cam->get_isp_bit(MV_ISP_BIT_GAMMA, &bit))
-        g_print("camera: internal gamma %s\n", bit ? "on" : "off");
 
-    /* Both, because they interact: in mode 0 the camera calibrates the pedestal itself and the
-       black level register holds an unused manual value, so the two disagreeing is normal and not
-       a fault. In mode 1 the register is what the sensor actually subtracts. */
+    /* The enable bit alone is not enough to act on: gamma enabled at 1.00 changes nothing, while any
+       other value is applied on top of whatever curve this element or cam-curve puts on, and would
+       break photometry silently. */
+    if (cam->get_isp_bit(MV_ISP_BIT_GAMMA, &bit)) {
+        double g = 0;
+        if (cam->gamma_value(&g))
+            g_print("camera: internal gamma %s, value %.2f%s\n", bit ? "on" : "off", g,
+                    (bit && g != 1.0) ? "  <- applied on top of any curve set here" : "");
+        else
+            g_print("camera: internal gamma %s, value not readable\n", bit ? "on" : "off");
+    }
+
     uint32_t m = 0, bl = 0;
     cam->read32(MV_BLACK_LEVEL, &bl);
     if (cam->blc_mode(&m))

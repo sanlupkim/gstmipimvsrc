@@ -83,7 +83,7 @@ These are off unless `i2c-bus` is set, so existing pipelines are unaffected.
 |---|---|---|
 | `i2c-bus` | -1 | -1 touches nothing, -2 finds the bus itself, or give the number |
 | `i2c-addr` | 0x3b | Address of the control block |
-| `probe` | false | Log model, serial, firmware, limits, temperature at start |
+| `probe` | false | Log model, serial, firmware, limits, temperature at start. Names the registers this firmware does not implement instead of printing their all-ones value as a number |
 | `exposure` | -1 | Exposure in microseconds |
 | `gain` | -1 | Gain in dB |
 | `cam-auto-exposure` | -1 | 0 manual, 1 auto once, 2 auto continuous |
@@ -395,7 +395,8 @@ Three registers named `DPC_Start` (0xC64), `DPC_Status` (0xC68) and `DPC_Count` 
 every version of the vendor's driver header, which suggests the camera can run its own detection pass -
 but they are absent from the published register map, no code they ship touches them, and nothing
 describes what values they take. `probe=true` prints 0xC6C as a raw register value for that reason,
-rather than calling it a pixel count.
+rather than calling it a pixel count - and on the IMX178 firmware tested here it reads all ones, i.e. the
+register is not implemented at all, so there is no detection pass to read a result from.
 
 The LUT is not an alternative. It is a tone curve - `LUT Count` (0x0C74) is 1024 or 4096 entries, with
 the data at 0x1800-0x37FF - so it maps an intensity to an intensity, identically for every pixel. The
