@@ -88,6 +88,10 @@ These are off unless `i2c-bus` is set, so existing pipelines are unaffected.
 | `gain` | -1 | Gain in dB |
 | `cam-auto-exposure` | -1 | 0 manual, 1 auto once, 2 auto continuous |
 | `cam-auto-gain` | -1 | Same values |
+| `cam-ae-target` | -1 | Mean level the auto loop aims at, 1..255 |
+| `cam-ae-max-time` | -1 | Longest exposure the auto loop may use, µs |
+| `cam-ag-max-gain` | -1 | Highest gain the auto loop may use, dB |
+| `cam-ae-roi` | — | `x,y,w,h` for the metering window, or `off` for the whole frame |
 | `cam-fps` | -1 | Frame rate; 0 takes it from `framerate`. Start only |
 | `cam-black-level` | -1 | The sensor's own offset |
 | `cam-gamma` | -1 | Camera gamma; 0 disables the curve |
@@ -126,6 +130,39 @@ How the 256 output levels get shared out, measured on a real frame at 40 dB:
 Read the black level off a corner of the frame outside the lens circle, in the camera's own units.
 Leaving it at 0 wastes the curve: the sensor offset is most of every pixel value and does not scale
 with gain, so the steepest part of the curve ends up lifting the offset rather than the signal.
+
+### Auto exposure, and why it needs limits
+
+`cam-auto-exposure=2` and `cam-auto-gain=2` hand exposure and gain to the camera. **Do not use them at
+night.** A changing exposure makes photometry between frames incomparable, and RMS has no way to know
+what changed between one FF block and the next. They exist for daytime all-sky capture, where the sky
+runs from full sun to overcast rain and no fixed setting covers it.
+
+The mode registers only say who decides. Four more say what it decides towards, and without them "auto"
+means the vendor's defaults, which assume a scene that fills the frame:
+
+- `cam-ae-target` is a mean output level. On an all-sky frame aim low, 60 to 90 rather than the usual
+  128: the sky is most of the frame, and metering it to mid grey puts the sun and the brightest cloud
+  into clipping, which is where the only detail is.
+- `cam-ae-roi` matters more than it looks. An all-sky lens does not fill a 4:3 sensor, so the frame
+  corners are outside the image circle and permanently black. Metering the whole frame averages that
+  dead area in, reads darker than the sky actually is, and overexposes by roughly that much. Give it a
+  window inside the circle. `off` restores whole-frame metering, which is not the same as leaving the
+  property empty - the camera keeps its last window across power cycles.
+- `cam-ae-max-time` caps the exposure. The camera clamps it to one frame period anyway, but set it well
+  below: the loop takes longest to come back down from an exposure at the ceiling, which is what makes
+  a sunrise overshoot.
+- `cam-ag-max-gain` caps the gain. In daylight set it low or zero. There is light to spare, and gain the
+  loop does not need costs dynamic range at the bright end.
+
+How much range the exposure alone has to cover: measured on an IMX178 with an all-sky lens, a sky in
+full sun is still **too dark** at 10 µs and 0 dB. So the short end has margin to spare, and the whole
+day from full sun to late dusk sits inside the exposure register with the gain left at zero. The gain is
+there for night, not for the day.
+
+`probe=true` prints all four back, and says whether the metering window is on. With the loop running it
+also prints what the camera settled on, read from `Exp_Time` and `Cur_Gain` rather than from the manual
+registers - those still hold whatever was written by hand and report the request, not the state.
 
 ### 16 bit output
 

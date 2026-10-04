@@ -152,6 +152,10 @@ typedef struct _GstMipiMvSrc {
     gint cam_testimg;
     gint cam_auto_exposure;
     gint cam_auto_gain;
+    gint cam_ae_target;
+    gint cam_ae_max_time;
+    gdouble cam_ag_max_gain;
+    gchar *cam_ae_roi;
     gint cam_lut;
     gint cam_blc;
     gboolean cam_curve;
@@ -204,6 +208,10 @@ enum {
     PROP_CAM_TESTIMG,
     PROP_CAM_AUTO_EXPOSURE,
     PROP_CAM_AUTO_GAIN,
+    PROP_CAM_AE_TARGET,
+    PROP_CAM_AE_MAX_TIME,
+    PROP_CAM_AG_MAX_GAIN,
+    PROP_CAM_AE_ROI,
     PROP_CAM_LUT,
     PROP_CAM_BLC,
     PROP_CAM_CURVE,
@@ -354,6 +362,23 @@ static void gst_mipimv_src_set_property(GObject *object, guint prop_id,
             src->cam_auto_exposure = g_value_get_int(value);
             mv_apply_live(src, prop_id);
             break;
+        case PROP_CAM_AE_TARGET:
+            src->cam_ae_target = g_value_get_int(value);
+            mv_apply_live(src, prop_id);
+            break;
+        case PROP_CAM_AE_MAX_TIME:
+            src->cam_ae_max_time = g_value_get_int(value);
+            mv_apply_live(src, prop_id);
+            break;
+        case PROP_CAM_AG_MAX_GAIN:
+            src->cam_ag_max_gain = g_value_get_double(value);
+            mv_apply_live(src, prop_id);
+            break;
+        case PROP_CAM_AE_ROI:
+            g_free(src->cam_ae_roi);
+            src->cam_ae_roi = g_value_dup_string(value);
+            mv_apply_live(src, prop_id);
+            break;
         case PROP_CAM_AUTO_GAIN:
             src->cam_auto_gain = g_value_get_int(value);
             mv_apply_live(src, prop_id);
@@ -476,6 +501,18 @@ static void gst_mipimv_src_get_property(GObject *object, guint prop_id,
             break;
         case PROP_CAM_AUTO_EXPOSURE:
             g_value_set_int(value, src->cam_auto_exposure);
+            break;
+        case PROP_CAM_AE_TARGET:
+            g_value_set_int(value, src->cam_ae_target);
+            break;
+        case PROP_CAM_AE_MAX_TIME:
+            g_value_set_int(value, src->cam_ae_max_time);
+            break;
+        case PROP_CAM_AG_MAX_GAIN:
+            g_value_set_double(value, src->cam_ag_max_gain);
+            break;
+        case PROP_CAM_AE_ROI:
+            g_value_set_string(value, src->cam_ae_roi);
             break;
         case PROP_CAM_AUTO_GAIN:
             g_value_set_int(value, src->cam_auto_gain);
@@ -700,6 +737,61 @@ static void mv_apply_live(GstMipiMvSrc *src, guint prop_id)
             if (src->cam_auto_gain >= 0)
                 src->i2c->set_gain_mode(src->cam_auto_gain);
             break;
+        case PROP_CAM_AE_TARGET:
+            if (src->cam_ae_target >= 0) {
+                int got = 0;
+                if (src->i2c->set_ae_target(src->cam_ae_target, &got))
+                    g_print("camera: auto exposure target %d -> %d\n", src->cam_ae_target, got);
+                else
+                    g_printerr("camera: auto exposure target failed: %s\n", src->i2c->error().c_str());
+            }
+            break;
+        case PROP_CAM_AE_MAX_TIME:
+            if (src->cam_ae_max_time >= 0) {
+                int got = 0;
+                if (src->i2c->set_ae_max_time_us(src->cam_ae_max_time, &got)) {
+                    g_print("camera: auto exposure ceiling %d us -> %d us\n", src->cam_ae_max_time, got);
+                    /* The camera clamps this against the frame period, so a ceiling that cannot be
+                       reached is worth saying out loud rather than leaving as a silent surprise. */
+                    if (got < src->cam_ae_max_time)
+                        g_print("camera: ceiling clamped, most likely by the frame rate\n");
+                } else {
+                    g_printerr("camera: auto exposure ceiling failed: %s\n", src->i2c->error().c_str());
+                }
+            }
+            break;
+        case PROP_CAM_AG_MAX_GAIN:
+            if (src->cam_ag_max_gain >= 0.0) {
+                double got = 0;
+                if (src->i2c->set_ag_max_gain_db(src->cam_ag_max_gain, &got))
+                    g_print("camera: auto gain ceiling %.1f dB -> %.1f dB\n", src->cam_ag_max_gain, got);
+                else
+                    g_printerr("camera: auto gain ceiling failed: %s\n", src->i2c->error().c_str());
+            }
+            break;
+        case PROP_CAM_AE_ROI:
+            /* An empty string means "do not touch it". An explicit "off" turns the window off and
+               measures the whole frame, which is not the same thing: the camera remembers the last
+               window across power cycles. */
+            if (src->cam_ae_roi && *src->cam_ae_roi) {
+                if (!g_ascii_strcasecmp(src->cam_ae_roi, "off")) {
+                    src->i2c->set_aa_roi_enable(0);
+                    g_print("camera: auto exposure measures the whole frame\n");
+                } else {
+                    int x = 0, y = 0, w = 0, h = 0;
+                    if (sscanf(src->cam_ae_roi, "%d,%d,%d,%d", &x, &y, &w, &h) == 4 && w > 0 && h > 0) {
+                        if (src->i2c->set_aa_roi(x, y, w, h) && src->i2c->set_aa_roi_enable(1))
+                            g_print("camera: auto exposure measures %dx%d at %d,%d\n", w, h, x, y);
+                        else
+                            g_printerr("camera: auto exposure window failed: %s\n",
+                                       src->i2c->error().c_str());
+                    } else {
+                        g_printerr("camera: cam-ae-roi wants \"x,y,w,h\" or \"off\", got \"%s\"\n",
+                                   src->cam_ae_roi);
+                    }
+                }
+            }
+            break;
         case PROP_CAM_LUT:
             if (src->cam_lut >= 0) {
                 src->i2c->set_lut_enable(src->cam_lut);
@@ -811,6 +903,38 @@ static void mv_log_probe(MvCam *cam)
     double db = 0;
     if (cam->get_exposure_us(&us) && cam->get_gain_db(&db))
         g_print("camera: now exposing %d us at %.1f dB\n", us, db);
+
+    /* What the auto loop is aiming at. Only interesting when it is running, but then it is the first
+       thing to check: a daytime frame that comes out white usually means the target is at the vendor's
+       default and the metering window still covers the black corners outside the image circle. */
+    uint32_t em = 0, gm = 0;
+    if (cam->read32(MV_EXPOSURE_MODE, &em) && cam->read32(MV_GAIN_MODE, &gm)
+        && MvCam::implemented(em) && MvCam::implemented(gm)) {
+        static const char *modes[] = { "manual", "auto once", "auto continuous" };
+        g_print("camera: exposure %s, gain %s\n",
+                (em < 3) ? modes[em] : "?", (gm < 3) ? modes[gm] : "?");
+
+        if (em || gm) {
+            uint32_t tgt = 0, aemax = 0, agmax = 0, roion = 0;
+            if (cam->read32(MV_AE_TARGET, &tgt) && MvCam::implemented(tgt))
+                g_print("camera: auto target %u of 255\n", tgt);
+            if (cam->read32(MV_AE_MAX_TIME, &aemax) && MvCam::implemented(aemax))
+                g_print("camera: auto exposure ceiling %u us\n", aemax);
+            if (cam->read32(MV_AG_MAX_GAIN, &agmax) && MvCam::implemented(agmax))
+                g_print("camera: auto gain ceiling %.1f dB\n", agmax/10.0);
+
+            int ax = 0, ay = 0, aw = 0, ah = 0;
+            bool have_roi = cam->get_aa_roi(&ax, &ay, &aw, &ah);
+            if (cam->read32(MV_AAROI_ENABLE, &roion) && MvCam::implemented(roion)) {
+                if (roion && have_roi)
+                    g_print("camera: auto metering window %dx%d at %d,%d\n", aw, ah, ax, ay);
+                else if (roion)
+                    g_print("camera: auto metering window on, but not readable\n");
+                else
+                    g_print("camera: auto metering reads the whole frame, corners included\n");
+            }
+        }
+    }
 }
 
 /* Builds this element's transfer curve at the camera's own LUT resolution and uploads it, so the camera
@@ -934,6 +1058,10 @@ static gboolean mv_setup_camera(GstMipiMvSrc *src)
         if (src->cam_testimg >= 0)       g_string_append(ignored, " cam-testimg");
         if (src->cam_auto_exposure >= 0) g_string_append(ignored, " cam-auto-exposure");
         if (src->cam_auto_gain >= 0)     g_string_append(ignored, " cam-auto-gain");
+        if (src->cam_ae_target >= 0)     g_string_append(ignored, " cam-ae-target");
+        if (src->cam_ae_max_time >= 0)   g_string_append(ignored, " cam-ae-max-time");
+        if (src->cam_ag_max_gain >= 0.0) g_string_append(ignored, " cam-ag-max-gain");
+        if (src->cam_ae_roi && *src->cam_ae_roi) g_string_append(ignored, " cam-ae-roi");
         if (src->cam_lut >= 0)           g_string_append(ignored, " cam-lut");
         if (src->cam_blc >= 0)           g_string_append(ignored, " cam-blc");
         if (src->cam_curve)              g_string_append(ignored, " cam-curve");
@@ -1026,6 +1154,12 @@ static gboolean mv_setup_camera(GstMipiMvSrc *src)
 
     /* Modes before values: writing a manual exposure while the camera is in auto mode is accepted and
        then immediately overridden by the auto loop. */
+    /* And the auto loop's limits before its mode, so it never gets a frame or two to run with the
+       vendor's defaults before being told what it is aiming at. */
+    mv_apply_live(src, PROP_CAM_AE_TARGET);
+    mv_apply_live(src, PROP_CAM_AE_MAX_TIME);
+    mv_apply_live(src, PROP_CAM_AG_MAX_GAIN);
+    mv_apply_live(src, PROP_CAM_AE_ROI);
     mv_apply_live(src, PROP_CAM_AUTO_EXPOSURE);
     mv_apply_live(src, PROP_CAM_AUTO_GAIN);
     mv_apply_live(src, PROP_EXPOSURE);
@@ -1588,6 +1722,7 @@ static void gst_mipimv_src_finalize(GObject *object)
 
     g_free(src->device);
     g_free(src->lut);
+    g_free(src->cam_ae_roi);
 
     G_OBJECT_CLASS(gst_mipimv_src_parent_class)->finalize(object);
 }
@@ -1799,6 +1934,38 @@ static void gst_mipimv_src_class_init(GstMipiMvSrcClass *klass)
             "same reason as cam-auto-exposure.",
             -1, 2, -1, G_PARAM_READWRITE));
 
+    g_object_class_install_property(gobject_class, PROP_CAM_AE_TARGET,
+        g_param_spec_int("cam-ae-target", "Auto exposure target",
+            "Mean output level the auto loop aims at, 1 to 255, -1 to leave alone. Only has an effect "
+            "with cam-auto-exposure or cam-auto-gain set to 1 or 2. For a daytime all-sky frame aim "
+            "low, around 60 to 90: the sky is most of the frame and metering it to mid grey leaves the "
+            "sun and the brightest cloud clipped, which is where the only detail is.",
+            -1, 255, -1, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_CAM_AE_MAX_TIME,
+        g_param_spec_int("cam-ae-max-time", "Auto exposure ceiling",
+            "Longest exposure in microseconds the auto loop may reach for, -1 to leave alone. The "
+            "camera clamps it against the frame period, so it cannot exceed one frame. Worth setting "
+            "well below that anyway: an exposure at the ceiling takes the loop longest to come back "
+            "down from, which is what makes a sunrise overshoot.",
+            -1, 100000000, -1, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_CAM_AG_MAX_GAIN,
+        g_param_spec_double("cam-ag-max-gain", "Auto gain ceiling",
+            "Highest gain in dB the auto loop may reach for, -1 to leave alone. In daylight this should "
+            "be low or zero: there is light to spare, and gain the loop does not need costs dynamic "
+            "range at the bright end where the sun is.",
+            -1.0, 100.0, -1.0, G_PARAM_READWRITE));
+
+    g_object_class_install_property(gobject_class, PROP_CAM_AE_ROI,
+        g_param_spec_string("cam-ae-roi", "Auto exposure window",
+            "Window the auto loop measures, as \"x,y,width,height\", or \"off\" to measure the whole "
+            "frame. Empty leaves it as it is, which is not the same as off: the camera keeps the last "
+            "window across power cycles. On an all-sky lens the frame corners are outside the image "
+            "circle and permanently black, so metering the whole frame reads about a third dark pixels "
+            "and overexposes the sky by roughly that much. A window inside the circle fixes it.",
+            NULL, (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
     g_object_class_install_property(gobject_class, PROP_CAM_LUT,
         g_param_spec_int("cam-lut", "User LUT",
             "The camera's user lookup table: -1 leave, 0 off, 1 on. Worth setting to 0 on a station "
@@ -1893,6 +2060,10 @@ static void gst_mipimv_src_init(GstMipiMvSrc *src)
     src->cam_testimg = -1;
     src->cam_auto_exposure = -1;
     src->cam_auto_gain = -1;
+    src->cam_ae_target = -1;
+    src->cam_ae_max_time = -1;
+    src->cam_ag_max_gain = -1.0;
+    src->cam_ae_roi = NULL;
     src->cam_lut = -1;
     src->cam_blc = -1;
     src->cam_curve = FALSE;

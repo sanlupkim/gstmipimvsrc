@@ -47,7 +47,6 @@
 enum MvReg {
     MV_MANUFACTURER      = 0x0000,
     MV_MODEL             = 0x0004,
-    MV_SENSOR_NAME       = 0x0008,
     MV_PRODUCT_INFO      = 0x000c,   /* serial number */
     MV_DEVICE_VERSION    = 0x0010,
     MV_PARAM_SAVE        = 0x0018,
@@ -80,12 +79,18 @@ enum MvReg {
     /* One register holds the ISP enables as bits, so changing one is a read-modify-write. */
     MV_ISP_MODULE_CTRL   = 0x0c00,
     MV_EXPOSURE_MODE     = 0x0c04,   /* 0 manual, 1 auto once, 2 auto continuous */
+    MV_AE_TARGET         = 0x0c08,   /* target mean brightness the auto loop aims at, 1..255 */
     MV_ME_TIME           = 0x0c10,   /* microseconds, no scaling */
+    MV_AE_MAX_TIME       = 0x0c14,   /* ceiling the auto loop may raise exposure to, microseconds */
     MV_EXP_TIME          = 0x0c18,   /* read only, microseconds */
     MV_GAIN_MODE         = 0x0c1c,   /* 0 manual, 1 auto once, 2 auto continuous */
     MV_MANUAL_GAIN       = 0x0c20,   /* dB x 10 */
     MV_AG_MAX_GAIN       = 0x0c24,   /* dB x 10 */
     MV_CUR_GAIN          = 0x0c28,   /* read only, dB x 10 */
+    MV_AAROI_OFFSET_X    = 0x0c2c,   /* window the auto loop measures, ignored unless AAROI_ENABLE */
+    MV_AAROI_OFFSET_Y    = 0x0c30,
+    MV_AAROI_WIDTH       = 0x0c34,
+    MV_AAROI_HEIGHT      = 0x0c38,
     MV_GAMMA             = 0x0c60,   /* gamma x 100 */
     MV_LUT_COUNT         = 0x0c74,   /* read only: how many entries the camera wants, 1024 or 4096 */
     MV_LUT_START         = 0x0c78,   /* write 1 to begin a transfer */
@@ -94,6 +99,7 @@ enum MvReg {
     /* Named DPC_Count in the vendor's driver header, but absent from their published register map and
        read by nothing they ship, so what it actually counts is unverified. */
     MV_DPC_COUNT         = 0x0c6c,
+    MV_AAROI_ENABLE      = 0x0c80,   /* 0 whole frame, 1 use the AAROI window */
     MV_MAX_EXP_TIME      = 0x0c8c,   /* read only, microseconds */
     MV_MIN_EXP_TIME      = 0x0c90,   /* read only, units of 0.1 microseconds */
 };
@@ -194,6 +200,23 @@ public:
     bool set_gamma(double gamma, double *actual);
     bool set_exposure_mode(int mode);
     bool set_gain_mode(int mode);
+
+    /* Auto exposure. The mode registers above only say who decides; these say what it decides towards,
+       and without them "auto" means the vendor's defaults, which are tuned for machine vision rather
+       than for a sky that spans full sun to overcast.
+
+       ae_target is a mean output level, 1..255, in the camera's 8 bit terms whatever the output format.
+       ae_max_time is the ceiling in microseconds and matters most: left at a default of tens of
+       milliseconds the loop will happily reach for a long exposure, which at 10 s cadence is harmless
+       but blurs cloud and, more to the point, makes the loop slow to come back down. ag_max_gain caps
+       the gain the same way, which is what keeps a dark frame noisy-but-honest rather than smeared. */
+    bool set_ae_target(int level, int *actual);
+    bool set_ae_max_time_us(int us, int *actual);
+    bool set_ag_max_gain_db(double db, double *actual);
+    bool set_aa_roi(int x, int y, int w, int h);
+    bool set_aa_roi_enable(int on);
+    bool get_aa_roi(int *x, int *y, int *w, int *h);
+
     /* Both live in MV_ISP_MODULE_CTRL, so these are read-modify-write on a shared register. */
     bool set_gamma_enable(int on);
     bool set_dpc_enable(int on);
@@ -217,6 +240,9 @@ public:
     bool save_params();
 
     /* Read-only current state, for logging. */
+    /* What the camera is actually doing, from MV_EXP_TIME and MV_CUR_GAIN. These are the ones to read
+       with the auto loop running: MV_ME_TIME and MV_MANUAL_GAIN still hold whatever was written
+       manually, so reading those back reports the request rather than the state. */
     bool get_exposure_us(int *us);
     bool get_gain_db(double *db);
 

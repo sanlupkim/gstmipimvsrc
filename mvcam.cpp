@@ -489,6 +489,63 @@ bool MvCam::set_gamma(double gamma, double *actual)
     return true;
 }
 
+bool MvCam::set_ae_target(int level, int *actual)
+{
+    if (!write32(MV_AE_TARGET, (uint32_t)level))
+        return false;
+    uint32_t v;
+    if (!read32(MV_AE_TARGET, &v))
+        return false;
+    *actual = (int)v;
+    return true;
+}
+
+bool MvCam::set_ae_max_time_us(int us, int *actual)
+{
+    if (!write32(MV_AE_MAX_TIME, (uint32_t)us))
+        return false;
+    uint32_t v;
+    if (!read32(MV_AE_MAX_TIME, &v))
+        return false;
+    /* The vendor reads this one back and prints it as "effective", which is a hint that the camera
+       clamps it against the frame rate: a ceiling longer than a frame period cannot be honoured. */
+    *actual = (int)v;
+    return true;
+}
+
+bool MvCam::set_ag_max_gain_db(double db, double *actual)
+{
+    if (!write32(MV_AG_MAX_GAIN, (uint32_t)(db*10.0 + 0.5)))
+        return false;
+    uint32_t v;
+    if (!read32(MV_AG_MAX_GAIN, &v))
+        return false;
+    *actual = v/10.0;
+    return true;
+}
+
+bool MvCam::set_aa_roi(int x, int y, int w, int h)
+{
+    return write32(MV_AAROI_OFFSET_X, (uint32_t)x)
+        && write32(MV_AAROI_OFFSET_Y, (uint32_t)y)
+        && write32(MV_AAROI_WIDTH,    (uint32_t)w)
+        && write32(MV_AAROI_HEIGHT,   (uint32_t)h);
+}
+
+bool MvCam::set_aa_roi_enable(int on) { return write32(MV_AAROI_ENABLE, (uint32_t)(on ? 1 : 0)); }
+
+bool MvCam::get_aa_roi(int *x, int *y, int *w, int *h)
+{
+    uint32_t a, b, c, d;
+    if (!read32(MV_AAROI_OFFSET_X, &a) || !read32(MV_AAROI_OFFSET_Y, &b)
+        || !read32(MV_AAROI_WIDTH, &c) || !read32(MV_AAROI_HEIGHT, &d))
+        return false;
+    if (!implemented(a) || !implemented(b) || !implemented(c) || !implemented(d))
+        return false;
+    *x = (int)a; *y = (int)b; *w = (int)c; *h = (int)d;
+    return true;
+}
+
 bool MvCam::set_exposure_mode(int mode) { return write32(MV_EXPOSURE_MODE, (uint32_t)mode); }
 bool MvCam::set_gain_mode(int mode)     { return write32(MV_GAIN_MODE, (uint32_t)mode); }
 bool MvCam::set_image_direction(int d)  { return write32(MV_IMAGE_DIRECTION, (uint32_t)d); }
@@ -590,7 +647,7 @@ bool MvCam::get_isp_bit(int bit, int *on)
 bool MvCam::get_exposure_us(int *us)
 {
     uint32_t v;
-    if (!read32(MV_EXP_TIME, &v))
+    if (!read32(MV_EXP_TIME, &v) || !implemented(v))
         return false;
     *us = (int)v;
     return true;
@@ -599,7 +656,7 @@ bool MvCam::get_exposure_us(int *us)
 bool MvCam::get_gain_db(double *db)
 {
     uint32_t v;
-    if (!read32(MV_CUR_GAIN, &v))
+    if (!read32(MV_CUR_GAIN, &v) || !implemented(v))
         return false;
     *db = v/10.0;
     return true;
