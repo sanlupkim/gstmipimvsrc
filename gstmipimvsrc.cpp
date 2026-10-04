@@ -87,6 +87,8 @@ typedef struct _GstMipiMvSrc {
     gfloat ghs_b;
     gfloat ghs_d;
     gfloat ghs_sp;
+    gboolean width_set;
+    gboolean height_set;
     gboolean ghs_b_set;
     gboolean ghs_d_set;
     gboolean ghs_sp_set;
@@ -236,9 +238,11 @@ static void gst_mipimv_src_set_property(GObject *object, guint prop_id,
             break;
         case PROP_WIDTH:
             src->width = g_value_get_int(value);
+            src->width_set = TRUE;
             break;
         case PROP_HEIGHT:
             src->height = g_value_get_int(value);
+            src->height_set = TRUE;
             break;
         case PROP_FRAMERATE: {
             src->fps_n = gst_value_get_fraction_numerator(value);
@@ -1140,15 +1144,32 @@ static gboolean mv_setup_camera(GstMipiMvSrc *src)
     if (src->probe)
         mv_log_probe(src->i2c);
 
-    /* The ROI the driver has, purely so a mismatch with this element's width and height is visible
-       in the log instead of showing up as a sheared image. Not written: the driver owns it. */
+    /* The frame size is the driver's to decide - it writes the ROI registers from the media-ctl
+       format - so take it from the camera rather than making the pipeline repeat it. Done here because
+       start() runs before caps negotiation, so the size reaches get_caps, the OpenCV request and the
+       unpacking stride alike.
+
+       A size given explicitly is left alone and only checked. Someone who wrote width= and height=
+       meant them, and silently overriding that would hide the real fault, which is on the media-ctl
+       side. The check cannot be skipped either way: this element cannot crop, so a size that disagrees
+       with the ROI does not produce a smaller picture, it produces a sheared one. */
     int rx = 0, ry = 0, rw = 0, rh = 0;
-    if (src->i2c->get_roi(&rx, &ry, &rw, &rh)) {
+    if (src->i2c->get_roi(&rx, &ry, &rw, &rh) && rw > 0 && rh > 0) {
+
         g_print("camera: ROI %dx%d at %d,%d\n", rw, rh, rx, ry);
-        if (rw != src->width || rh != src->height)
-            g_printerr("camera: ROI is %dx%d but this element is set to %dx%d. Fix the "
-                       "media_setting_rpi5.sh call; unpacking a mismatched size shears the image.\n",
+
+        if (!src->width_set && !src->height_set) {
+            if (rw != src->width || rh != src->height)
+                g_print("camera: taking the frame size from the camera: %dx%d\n", rw, rh);
+            src->width = rw;
+            src->height = rh;
+
+        } else if (rw != src->width || rh != src->height) {
+            g_printerr("camera: ROI is %dx%d but width/height say %dx%d. Fix the "
+                       "media_setting_rpi5.sh call, or drop width and height and let this element "
+                       "read them; unpacking a mismatched size shears the image.\n",
                        rw, rh, src->width, src->height);
+        }
     }
 
     /* Frame rate. 0 takes it from the framerate property, so the camera and the negotiated caps
@@ -2073,8 +2094,12 @@ static void gst_mipimv_src_init(GstMipiMvSrc *src)
     src->cap = NULL;
     src->lut = NULL;
     src->device = g_strdup("/dev/video0");
+    /* Only a fallback. With i2c-bus set, the camera's own ROI replaces these at start, which is the
+       normal case: the driver owns the frame size and nothing good comes of guessing it. */
     src->width = 1920;
     src->height = 1080;
+    src->width_set = FALSE;
+    src->height_set = FALSE;
     src->fps_n = 30;
     src->fps_d = 1;
     src->format = FORMAT_GRAY8;

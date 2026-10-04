@@ -63,7 +63,7 @@ file is actually in use, and `GST_PLUGIN_PATH` can be pointing somewhere else en
 | property | default | what it does |
 |---|---|---|
 | `device` | `/dev/video0` | Device path, or a bare number for an index |
-| `width`, `height` | 1920x1080 | Frame size, after any ROI set on the driver |
+| `width`, `height` | from the camera | Frame size. Read from the camera's ROI when `i2c-bus` is set, so normally leave both out |
 | `framerate` | 30/1 | Only used for buffer duration and the `frames` stamp mode |
 | `format` | `GRAY8` | Input pixel format: `GRAY8`, `Y10P` or `Y12P` |
 | `out-format` | `GRAY8` | What goes on the pad: `GRAY8` or `GRAY16_LE` |
@@ -78,6 +78,12 @@ file is actually in use, and `GST_PLUGIN_PATH` can be pointing somewhere else en
 ### Camera control
 
 These are off unless `i2c-bus` is set, so existing pipelines are unaffected.
+
+With it set, the element also reads the frame size from the camera's ROI, so `width` and `height` can
+be left out of the pipeline. That is the better way round: the driver writes the ROI registers from the
+media-ctl format, so it owns the size, and this element cannot crop - a `width` that disagrees with the
+ROI does not give a smaller picture, it gives a sheared one. Give them explicitly only if you want that
+disagreement reported rather than corrected.
 
 | property | default | what it does |
 |---|---|---|
