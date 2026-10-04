@@ -777,9 +777,15 @@ static void mv_log_probe(MvCam *cam)
     if (cam->get_isp_bit(MV_ISP_BIT_GAMMA, &bit))
         g_print("camera: internal gamma %s\n", bit ? "on" : "off");
 
-    uint32_t m = 0;
+    /* Both, because they interact: in mode 0 the camera calibrates the pedestal itself and the
+       black level register holds an unused manual value, so the two disagreeing is normal and not
+       a fault. In mode 1 the register is what the sensor actually subtracts. */
+    uint32_t m = 0, bl = 0;
+    cam->read32(MV_BLACK_LEVEL, &bl);
     if (cam->blc_mode(&m))
-        g_print("camera: black level correction mode %u\n", m);
+        g_print("camera: black level register %u, correction mode %u (%s)\n", bl, m,
+                (m == 0) ? "automatic - the register is not applied, and the real pedestal can drift"
+                         : "manual - the register is what gets subtracted");
 
     uint32_t err = 0;
     if (cam->error_code(&err) && err)

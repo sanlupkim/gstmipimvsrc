@@ -95,7 +95,7 @@ These are off unless `i2c-bus` is set, so existing pipelines are unaffected.
 | `cam-imgdir` | -1 | 0 normal, 1 mirror, 2 flip, 3 both |
 | `cam-testimg` | -1 | Built-in test pattern |
 | `cam-lut` | -1 | User LUT, 0 off, 1 on. Set 0 if photometry matters |
-| `cam-blc` | -1 | Black level correction mode |
+| `cam-blc` | -1 | Black level correction mode, 0 automatic, 1 manual |
 | `temperature` | — | Sensor temperature in °C, read only |
 
 `-1` everywhere means "leave whatever the camera already has", so you can set one control without
@@ -328,6 +328,24 @@ anyway: an exposure that moves makes photometry between frames incomparable.
 `cam-black-level` and `cam-gamma` are the **camera's own** settings and are a different thing. In the
 example above the camera's gamma is left alone and the mapping is done here, because that is the one
 curve RMS can invert.
+
+### Black level: the register and the pedestal are different things
+
+`cam-blc` selects between the camera calibrating its own black level (mode 0) and subtracting the value
+in the black level register (mode 1). In mode 0 **the register is not applied**, so reading it back gives
+a number unrelated to the pedestal actually present in the data - one camera reported 60 while its RAW12
+frames sat at about 199. That is not a fault, and `probe=true` now prints both together with which one is
+in force.
+
+It matters because `black-level` on this element is a fixed number, and in mode 0 the pedestal the camera
+produces can move between nights and with temperature. If the pedestal drifts up past `black-level` the
+sky clips to zero; if it drifts down, range is spent on the pedestal instead of the sky. Pinning it with
+`cam-blc=1` and a measured value removes that, but do measure first: switching to mode 1 makes the
+register live, and if it holds something far from the real pedestal the image changes abruptly.
+
+The pedestal itself is measured by capping the lens and taking the median of a RAW12 frame. It cannot be
+read off a normal sky frame, and it cannot be read off the unlit-looking corners of a daylight frame
+either - on this lens those corners still carried 88% of the centre's signal at 0 dB.
 
 ### Frames the camera dropped by itself
 
