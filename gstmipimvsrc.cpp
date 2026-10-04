@@ -1998,16 +1998,18 @@ static void gst_mipimv_src_class_init(GstMipiMvSrcClass *klass)
     g_object_class_install_property(gobject_class, PROP_CAM_AE_MAX_TIME,
         g_param_spec_int("cam-ae-max-time", "Auto exposure ceiling",
             "Longest exposure in microseconds the auto loop may reach for, -1 to leave alone. The "
-            "camera clamps it against the frame period, so it cannot exceed one frame. Worth setting "
-            "well below that anyway: an exposure at the ceiling takes the loop longest to come back "
-            "down from, which is what makes a sunrise overshoot.",
+            "camera clamps it against the frame period, so it cannot exceed one frame. Setting it well "
+            "below only helps a scene that never gets dark: an exposure at the ceiling takes the loop "
+            "longest to come back down from, which is what makes a sunrise overshoot, but a low ceiling "
+            "makes dusk go black.",
             -1, 100000000, -1, G_PARAM_READWRITE));
 
     g_object_class_install_property(gobject_class, PROP_CAM_AG_MAX_GAIN,
         g_param_spec_double("cam-ag-max-gain", "Auto gain ceiling",
-            "Highest gain in dB the auto loop may reach for, -1 to leave alone. In daylight this should "
-            "be low or zero: there is light to spare, and gain the loop does not need costs dynamic "
-            "range at the bright end where the sun is.",
+            "Highest gain in dB the auto loop may reach for, -1 to leave alone. A cap only binds once "
+            "the exposure ceiling is reached, so in full sun the loop sits at minimum exposure and 0 dB "
+            "whatever this says. What it decides is how twilight looks, and day mode runs until the Sun "
+            "is well down: zero makes dusk go black, 15 to 20 dB costs nothing by day.",
             -1.0, 100.0, -1.0, G_PARAM_READWRITE));
 
     g_object_class_install_property(gobject_class, PROP_CAM_AE_ROI,

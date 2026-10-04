@@ -155,10 +155,14 @@ means the vendor's defaults, which assume a scene that fills the frame:
   window inside the circle. `off` restores whole-frame metering, which is not the same as leaving the
   property empty - the camera keeps its last window across power cycles.
 - `cam-ae-max-time` caps the exposure. The camera clamps it to one frame period anyway, but set it well
-  below: the loop takes longest to come back down from an exposure at the ceiling, which is what makes
-  a sunrise overshoot.
-- `cam-ag-max-gain` caps the gain. In daylight set it low or zero. There is light to spare, and gain the
-  loop does not need costs dynamic range at the bright end.
+  below only if the scene never gets dark - with day mode running into dusk, just under one frame
+  period is the useful setting. The cost of a high ceiling is that the loop takes longest to come back
+  down from an exposure at the ceiling, which is what makes a sunrise overshoot.
+- `cam-ag-max-gain` caps the gain, and the obvious advice - set it to zero, there is light to spare -
+  is wrong. A cap only binds when the exposure ceiling has already been reached, so in full sun the
+  loop sits at minimum exposure and 0 dB whatever the cap says. What the cap actually decides is how
+  the picture ends in twilight, and day mode runs until the Sun is 9 degrees down. Zero makes dusk go
+  black; something like 15 to 20 dB costs nothing by day and keeps the last of the light.
 
 How much range the exposure alone has to cover: measured on an IMX178 with an all-sky lens, a sky in
 full sun is still **too dark** at 10 µs and 0 dB. So the short end has margin to spare, and the whole
