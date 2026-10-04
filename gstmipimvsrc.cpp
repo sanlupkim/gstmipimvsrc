@@ -864,6 +864,12 @@ static void mv_log_probe(MvCam *cam)
     else
         g_print("camera: sensor temperature not reported by this firmware\n");
 
+    /* The whole ISP control word, because the three bits below share it and a surprise in one of them
+       is easiest to recognise next to the others. All ones here would mean the read itself failed. */
+    uint32_t isp = 0;
+    if (cam->read32(MV_ISP_MODULE_CTRL, &isp))
+        g_print("camera: ISP control register 0x%08x\n", isp);
+
     int bit = 0;
     if (cam->get_isp_bit(MV_ISP_BIT_DPC, &bit))
         g_print("camera: defect pixel correction %s\n", bit ? "on" : "off");

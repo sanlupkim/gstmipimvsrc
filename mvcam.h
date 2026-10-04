@@ -164,6 +164,7 @@ public:
     /* Several registers are simply absent on some firmware and read back as all ones. Anything built on
        top of a raw read has to treat that as "no answer" rather than as a value. */
     static bool implemented(uint32_t v) { return v != 0xffffffffu; }
+    void set_error(const char *msg) { error_ = msg; }
     bool temperature_c(double *out);
     bool gamma_value(double *out);
     bool sensor_size(int *w, int *h);

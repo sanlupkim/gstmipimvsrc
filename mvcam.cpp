@@ -559,6 +559,13 @@ static bool isp_set_bit(MvCam *cam, int bit, int on)
     uint32_t v;
     if (!cam->read32(MV_ISP_MODULE_CTRL, &v))
         return false;
+    /* A read-modify-write on a bad read is worse than no write at all: all ones ORed with the mask is
+       all ones, and writing that back would switch on every module in the ISP at once - gamma, DPC, the
+       LUT and the white balance - each of which quietly alters pixel values. Refuse instead. */
+    if (!MvCam::implemented(v)) {
+        cam->set_error("ISP control register read as all ones, refusing to write it back");
+        return false;
+    }
     uint32_t mask = 1u << bit;
     uint32_t nv = on ? (v | mask) : (v & ~mask);
     if (nv == v)
@@ -638,7 +645,7 @@ bool MvCam::set_lut_enable(int on)   { return isp_set_bit(this, MV_ISP_BIT_LUT, 
 bool MvCam::get_isp_bit(int bit, int *on)
 {
     uint32_t v;
-    if (!read32(MV_ISP_MODULE_CTRL, &v))
+    if (!read32(MV_ISP_MODULE_CTRL, &v) || !implemented(v))
         return false;
     *on = (v >> bit) & 1;
     return true;
