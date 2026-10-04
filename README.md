@@ -116,6 +116,11 @@ and neither the bit assembly nor the table lookup is needed. It throws away the 
 undo**: put the same exponent in the RMS config as `gamma` and star intensities come out right. Use
 this one unless photometry does not matter.
 
+`trans`, `gamma`, `black-level` and the `ghs-*` shape can be changed while the pipeline runs: the
+table is rebuilt on the spot, so a day mode and a night mode can carry different curves. The one
+exception is `cam-curve`, where the curve lives in the camera and is uploaded once - changing it mid
+stream is refused out loud rather than accepted and ignored.
+
 `ghs` is the Generalized Hyperbolic Stretch used by Siril. It resolves the faint end better than
 gamma but RMS cannot invert it, so magnitudes come out wrong.
 

@@ -222,6 +222,7 @@ enum {
    is already running takes effect instead of being silently stored for next time. Reads back and logs
    what the camera actually took: it clamps out-of-range values rather than refusing them. */
 static void mv_apply_live(GstMipiMvSrc *src, guint prop_id);
+static void mv_rebuild_host_lut_if_running(GstMipiMvSrc *src);
 
 static void gst_mipimv_src_set_property(GObject *object, guint prop_id,
                                     const GValue *value, GParamSpec *pspec)
@@ -268,6 +269,7 @@ static void gst_mipimv_src_set_property(GObject *object, guint prop_id,
                 src->trans = TRANS_GAMMA;
             else
                 g_warning("mipimvsrc: unknown trans '%s', keeping the previous one", trans);
+            mv_rebuild_host_lut_if_running(src);
             break;
         }
         case PROP_OUT_FORMAT: {
@@ -283,20 +285,25 @@ static void gst_mipimv_src_set_property(GObject *object, guint prop_id,
         case PROP_GHS_B:
             src->ghs_b = g_value_get_float(value);
             src->ghs_b_set = TRUE;
+            mv_rebuild_host_lut_if_running(src);
             break;
         case PROP_GHS_D:
             src->ghs_d = g_value_get_float(value);
             src->ghs_d_set = TRUE;
+            mv_rebuild_host_lut_if_running(src);
             break;
         case PROP_GHS_SP:
             src->ghs_sp = g_value_get_float(value);
             src->ghs_sp_set = TRUE;
+            mv_rebuild_host_lut_if_running(src);
             break;
         case PROP_GAMMA:
             src->gamma = g_value_get_float(value);
+            mv_rebuild_host_lut_if_running(src);
             break;
         case PROP_BLACK_LEVEL:
             src->black_level = g_value_get_int(value);
+            mv_rebuild_host_lut_if_running(src);
             break;
         case PROP_STAMPS: {
             const char *st = g_value_get_string(value);
@@ -1188,30 +1195,41 @@ static gboolean mv_setup_camera(GstMipiMvSrc *src)
     return TRUE;
 }
 
-static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
+/* Fills the host transfer table from trans, gamma, black-level and the GHS shape.
+ *
+ * Separate from start because these can be changed while the stream is up - that is how a day and
+ * night mode get different curves - and a table built once at start would make such a change a silent
+ * no-op: the property would read back as set and the frames would not change.
+ *
+ * Filled in place rather than allocated and swapped. The unpacking threads read this table without a
+ * lock, so freeing the old one under them would be a use-after-free, whereas updating in place can at
+ * worst give one frame a mixture of the old and new curve. For a curve change at dusk that is invisible;
+ * a crash would not be.
+ */
+static void mv_build_host_lut(GstMipiMvSrc *src)
 {
-    GstMipiMvSrc *src = (GstMipiMvSrc *)basesrc;
-
     float B = src->ghs_b, D = src->ghs_d, SP = src->ghs_sp;
 
-    g_free(src->lut);
-    src->lut = NULL;
-
-    if (src->format == FORMAT_GRAY8) {
-        src->lut_size = 256;
-    } else if (src->format == FORMAT_Y10P) {
-        src->lut_size = 1024;
+    int want_size = 256;
+    if (src->format == FORMAT_Y10P) {
+        want_size = 1024;
         if (!src->ghs_b_set)  B  = -0.99f;
         if (!src->ghs_d_set)  D  = 10.0f;
         if (!src->ghs_sp_set) SP = 0.12f;
     } else if (src->format == FORMAT_Y12P) {
-        src->lut_size = 4096;
+        want_size = 4096;
         if (!src->ghs_b_set)  B  = -0.99f;
         if (!src->ghs_d_set)  D  = 70.0f;
         if (!src->ghs_sp_set) SP = 0.03f;
     }
 
-    src->lut = (unsigned char*)g_malloc(src->lut_size);
+    /* The size follows the input format, which is fixed for the life of the stream, so in practice this
+       only allocates on the first call. */
+    if (src->lut == NULL || src->lut_size != want_size) {
+        g_free(src->lut);
+        src->lut_size = want_size;
+        src->lut = (unsigned char*)g_malloc(src->lut_size);
+    }
 
     if (src->trans == TRANS_LIN) {
 
@@ -1238,6 +1256,35 @@ static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
 
         build_ghs_lut(src->lut, src->lut_size, B, D, SP, src->black_level);
     }
+}
+
+
+/* Redo the table after a curve property changed mid-stream. Does nothing before the first start,
+ * where the table does not exist yet and start will build it anyway.
+ */
+static void mv_rebuild_host_lut_if_running(GstMipiMvSrc *src)
+{
+    if (src->lut == NULL)
+        return;
+
+    /* With cam-curve the camera holds the curve and this table is the top-8-bits ramp that must not be
+       disturbed, or the frame gets curved twice. Say so rather than appearing to accept the change:
+       the curve has to be set before the stream starts, because it is uploaded once. */
+    if (src->curve_in_camera) {
+        g_printerr("camera: the curve is in the camera, so changing it while running has no effect - "
+                   "set it before starting the pipeline\n");
+        return;
+    }
+
+    mv_build_host_lut(src);
+}
+
+
+static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
+{
+    GstMipiMvSrc *src = (GstMipiMvSrc *)basesrc;
+
+    mv_build_host_lut(src);
 
     /* Before the device: the sensor format and ROI decide the byte layout the capture side will see,
        so they cannot be changed once the stream is up. */
