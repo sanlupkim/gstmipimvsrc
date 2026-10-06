@@ -31,6 +31,20 @@
    is 4). Asking for more releases the buffers it had and then refuses, leaving capture dead. */
 #define OPENCV_MAX_V4L_BUFFERS 10
 
+/* Everything this element has to say goes through GStreamer's logging rather than to stdout, because
+ * stdout is not where anyone is looking. RMS installs a GStreamer log handler and routes it into its
+ * own log file, so a message sent this way lands beside the rest of the capture log; one printed with
+ * g_print lands wherever the launcher happened to point stdout, which for a service is nowhere.
+ *
+ * Levels are chosen against RMS's default threshold of 2, which is WARNING: anything that needs acting
+ * on is WARNING or ERROR and shows up without being asked for, while the running commentary is INFO
+ * and appears on request with
+ *
+ *     GST_DEBUG=mipimvsrc:4
+ */
+GST_DEBUG_CATEGORY_STATIC(mipimvsrc_debug);
+#define GST_CAT_DEFAULT mipimvsrc_debug
+
 /* A frame older than this when it reaches us was sitting in the driver's queue rather than being
    captured for us. Several frame intervals, so ordinary queue latency never trips it. */
 #define MV_STALE_FRAMES 5
@@ -269,7 +283,7 @@ static void gst_mipimv_src_set_property(GObject *object, guint prop_id,
             else if (g_strcmp0(fmt, "Y12P") == 0)
                 src->format = FORMAT_Y12P;
             else
-                g_warning("mipimvsrc: unknown format '%s', keeping the previous one", fmt);
+                GST_WARNING("mipimvsrc: unknown format '%s', keeping the previous one", fmt);
             break;
         }
         case PROP_TRANS: {
@@ -283,7 +297,7 @@ static void gst_mipimv_src_set_property(GObject *object, guint prop_id,
             else if (g_strcmp0(trans, "gamma") == 0)
                 src->trans = TRANS_GAMMA;
             else
-                g_warning("mipimvsrc: unknown trans '%s', keeping the previous one", trans);
+                GST_WARNING("mipimvsrc: unknown trans '%s', keeping the previous one", trans);
             mv_rebuild_host_lut_if_running(src);
             break;
         }
@@ -294,7 +308,7 @@ static void gst_mipimv_src_set_property(GObject *object, guint prop_id,
             else if (g_strcmp0(of, "GRAY16_LE") == 0)
                 src->out_format = OUT_GRAY16_LE;
             else
-                g_warning("mipimvsrc: unknown out-format '%s', keeping the previous one", of);
+                GST_WARNING("mipimvsrc: unknown out-format '%s', keeping the previous one", of);
             break;
         }
         case PROP_GHS_B:
@@ -329,7 +343,7 @@ static void gst_mipimv_src_set_property(GObject *object, guint prop_id,
             else if (g_strcmp0(st, "frames") == 0)
                 src->stamps = STAMP_FRAMES;
             else
-                g_warning("mipimvsrc: unknown stamps '%s', keeping the previous one", st);
+                GST_WARNING("mipimvsrc: unknown stamps '%s', keeping the previous one", st);
             break;
         }
         case PROP_THREADS:
@@ -628,7 +642,7 @@ static void build_ghs_curve(float *out, int lut_size, float B, float D, float SP
 
     // B == 1 puts a zero in every denominator below, and a flat curve carries no information anyway
     if (fabsf(B - 1.0f) < 1e-6f || D <= 0.0f) {
-        g_warning("mipimvsrc: GHS parameters degenerate (b=%.3f d=%.3f), falling back to linear", -B, D);
+        GST_WARNING("mipimvsrc: GHS parameters degenerate (b=%.3f d=%.3f), falling back to linear", -B, D);
         int div = lut_size/256;
         for (int i = 0; i < lut_size; i++)
             out[i] = (float)(i/(div > 0 ? div : 1))/255.0f;
@@ -641,7 +655,7 @@ static void build_ghs_curve(float *out, int lut_size, float B, float D, float SP
     float q1  = qwp + D*(1.0f - HP)*powf(1.0f + D*B*(HP - SP), -1.0f/B);
 
     if (fabsf(q1 - q0) < 1e-9f) {
-        g_warning("mipimvsrc: GHS curve is degenerate, falling back to linear");
+        GST_WARNING("mipimvsrc: GHS curve is degenerate, falling back to linear");
         int div = lut_size/256;
         for (int i = 0; i < lut_size; i++)
             out[i] = (float)(i/(div > 0 ? div : 1))/255.0f;
@@ -707,25 +721,25 @@ static void mv_apply_live(GstMipiMvSrc *src, guint prop_id)
             if (src->cam_exposure_us >= 0) {
                 int got = 0;
                 if (src->i2c->set_exposure_us(src->cam_exposure_us, &got))
-                    g_print("camera: exposure %d us -> %d us\n", src->cam_exposure_us, got);
+                    GST_INFO("camera: exposure %d us -> %d us", src->cam_exposure_us, got);
                 else
-                    g_printerr("camera: exposure failed: %s\n", src->i2c->error().c_str());
+                    GST_WARNING("camera: exposure failed: %s", src->i2c->error().c_str());
             }
             break;
         case PROP_GAIN:
             if (src->cam_gain_db >= 0.0) {
                 double got = 0;
                 if (src->i2c->set_gain_db(src->cam_gain_db, &got))
-                    g_print("camera: gain %.1f dB -> %.1f dB\n", src->cam_gain_db, got);
+                    GST_INFO("camera: gain %.1f dB -> %.1f dB", src->cam_gain_db, got);
                 else
-                    g_printerr("camera: gain failed: %s\n", src->i2c->error().c_str());
+                    GST_WARNING("camera: gain failed: %s", src->i2c->error().c_str());
             }
             break;
         case PROP_CAM_BLACK_LEVEL:
             if (src->cam_black_level >= 0) {
                 int got = 0;
                 if (src->i2c->set_black_level(src->cam_black_level, &got))
-                    g_print("camera: black level %d -> %d\n", src->cam_black_level, got);
+                    GST_INFO("camera: black level %d -> %d", src->cam_black_level, got);
             }
             break;
         case PROP_CAM_GAMMA:
@@ -734,13 +748,13 @@ static void mv_apply_live(GstMipiMvSrc *src, guint prop_id)
                 /* A gamma of 0 is how you ask for the curve to be bypassed. */
                 src->i2c->set_gamma_enable(src->cam_gamma > 0.0 ? 1 : 0);
                 if (src->cam_gamma > 0.0 && src->i2c->set_gamma(src->cam_gamma, &got))
-                    g_print("camera: gamma %.2f -> %.2f\n", src->cam_gamma, got);
+                    GST_INFO("camera: gamma %.2f -> %.2f", src->cam_gamma, got);
             }
             break;
         case PROP_CAM_DPC:
             if (src->cam_dpc >= 0) {
                 src->i2c->set_dpc_enable(src->cam_dpc);
-                g_print("camera: defect pixel correction %s\n", src->cam_dpc ? "on" : "off");
+                GST_INFO("camera: defect pixel correction %s", src->cam_dpc ? "on" : "off");
             }
             break;
         case PROP_CAM_IMGDIR:
@@ -763,22 +777,22 @@ static void mv_apply_live(GstMipiMvSrc *src, guint prop_id)
             if (src->cam_ae_target >= 0) {
                 int got = 0;
                 if (src->i2c->set_ae_target(src->cam_ae_target, &got))
-                    g_print("camera: auto exposure target %d -> %d\n", src->cam_ae_target, got);
+                    GST_INFO("camera: auto exposure target %d -> %d", src->cam_ae_target, got);
                 else
-                    g_printerr("camera: auto exposure target failed: %s\n", src->i2c->error().c_str());
+                    GST_WARNING("camera: auto exposure target failed: %s", src->i2c->error().c_str());
             }
             break;
         case PROP_CAM_AE_MAX_TIME:
             if (src->cam_ae_max_time >= 0) {
                 int got = 0;
                 if (src->i2c->set_ae_max_time_us(src->cam_ae_max_time, &got)) {
-                    g_print("camera: auto exposure ceiling %d us -> %d us\n", src->cam_ae_max_time, got);
+                    GST_INFO("camera: auto exposure ceiling %d us -> %d us", src->cam_ae_max_time, got);
                     /* The camera clamps this against the frame period, so a ceiling that cannot be
                        reached is worth saying out loud rather than leaving as a silent surprise. */
                     if (got < src->cam_ae_max_time)
-                        g_print("camera: ceiling clamped, most likely by the frame rate\n");
+                        GST_INFO("camera: ceiling clamped, most likely by the frame rate");
                 } else {
-                    g_printerr("camera: auto exposure ceiling failed: %s\n", src->i2c->error().c_str());
+                    GST_WARNING("camera: auto exposure ceiling failed: %s", src->i2c->error().c_str());
                 }
             }
             break;
@@ -786,9 +800,9 @@ static void mv_apply_live(GstMipiMvSrc *src, guint prop_id)
             if (src->cam_ag_max_gain >= 0.0) {
                 double got = 0;
                 if (src->i2c->set_ag_max_gain_db(src->cam_ag_max_gain, &got))
-                    g_print("camera: auto gain ceiling %.1f dB -> %.1f dB\n", src->cam_ag_max_gain, got);
+                    GST_INFO("camera: auto gain ceiling %.1f dB -> %.1f dB", src->cam_ag_max_gain, got);
                 else
-                    g_printerr("camera: auto gain ceiling failed: %s\n", src->i2c->error().c_str());
+                    GST_WARNING("camera: auto gain ceiling failed: %s", src->i2c->error().c_str());
             }
             break;
         case PROP_CAM_AE_ROI:
@@ -798,18 +812,18 @@ static void mv_apply_live(GstMipiMvSrc *src, guint prop_id)
             if (src->cam_ae_roi && *src->cam_ae_roi) {
                 if (!g_ascii_strcasecmp(src->cam_ae_roi, "off")) {
                     src->i2c->set_aa_roi_enable(0);
-                    g_print("camera: auto exposure measures the whole frame\n");
+                    GST_INFO("camera: auto exposure measures the whole frame");
                 } else {
                     int x = 0, y = 0, w = 0, h = 0;
                     if (sscanf(src->cam_ae_roi, "%d,%d,%d,%d", &x, &y, &w, &h) == 4 && w > 0 && h > 0) {
                         if (src->i2c->set_aa_roi(x, y, w, h) && src->i2c->set_aa_roi_enable(1))
-                            g_print("camera: auto exposure measures %dx%d at %d,%d\n", w, h, x, y);
+                            GST_INFO("camera: auto exposure measures %dx%d at %d,%d", w, h, x, y);
                         else
-                            g_printerr("camera: auto exposure window failed: %s\n",
-                                       src->i2c->error().c_str());
+                            GST_WARNING("camera: auto exposure window failed: %s",
+                                        src->i2c->error().c_str());
                     } else {
-                        g_printerr("camera: cam-ae-roi wants \"x,y,w,h\" or \"off\", got \"%s\"\n",
-                                   src->cam_ae_roi);
+                        GST_WARNING("camera: cam-ae-roi wants \"x,y,w,h\" or \"off\", got \"%s\"",
+                                    src->cam_ae_roi);
                     }
                 }
             }
@@ -817,14 +831,14 @@ static void mv_apply_live(GstMipiMvSrc *src, guint prop_id)
         case PROP_CAM_LUT:
             if (src->cam_lut >= 0) {
                 src->i2c->set_lut_enable(src->cam_lut);
-                g_print("camera: user LUT %s\n", src->cam_lut ? "on" : "off");
+                GST_INFO("camera: user LUT %s", src->cam_lut ? "on" : "off");
             }
             break;
         case PROP_CAM_BLC:
             if (src->cam_blc >= 0) {
                 int got = 0;
                 if (src->i2c->set_blc_mode(src->cam_blc, &got))
-                    g_print("camera: black level correction mode %d -> %d\n", src->cam_blc, got);
+                    GST_INFO("camera: black level correction mode %d -> %d", src->cam_blc, got);
             }
             break;
         default:
@@ -843,66 +857,66 @@ static void mv_log_probe(MvCam *cam)
     uint32_t code = 0, ser = 0;
 
     if (cam->manufacturer(&manu) && cam->model(&mdl, &code))
-        g_print("camera: %s %s\n", manu.c_str(), mdl.c_str());
+        GST_INFO("camera: %s %s", manu.c_str(), mdl.c_str());
     if (cam->serial(&ser))
-        g_print("camera: serial 0x%08x\n", ser);
+        GST_INFO("camera: serial 0x%08x", ser);
     if (cam->version(&ver))
-        g_print("camera: firmware %s\n", ver.c_str());
+        GST_INFO("camera: firmware %s", ver.c_str());
 
     int w = 0, h = 0;
     if (cam->sensor_size(&w, &h))
-        g_print("camera: sensor %dx%d\n", w, h);
+        GST_INFO("camera: sensor %dx%d", w, h);
 
     int rx = 0, ry = 0, rw = 0, rh = 0;
     if (cam->get_roi(&rx, &ry, &rw, &rh))
-        g_print("camera: current ROI %dx%d at %d,%d\n", rw, rh, rx, ry);
+        GST_INFO("camera: current ROI %dx%d at %d,%d", rw, rh, rx, ry);
 
     double lo = 0, hi = 0;
     if (cam->framerate_range(&lo, &hi))
-        g_print("camera: frame rate %.2f..%.2f fps\n", lo, hi);
+        GST_INFO("camera: frame rate %.2f..%.2f fps", lo, hi);
     else
-        g_print("camera: frame rate limits not reported by this firmware\n");
+        GST_INFO("camera: frame rate limits not reported by this firmware");
 
     if (cam->exposure_range_us(&lo, &hi))
-        g_print("camera: exposure %.1f..%.0f us\n", lo, hi);
+        GST_INFO("camera: exposure %.1f..%.0f us", lo, hi);
     else
-        g_print("camera: exposure limits not reported by this firmware\n");
+        GST_INFO("camera: exposure limits not reported by this firmware");
 
     if (cam->min_roi(&w, &h))
-        g_print("camera: smallest ROI %dx%d\n", w, h);
+        GST_INFO("camera: smallest ROI %dx%d", w, h);
 
     uint32_t mask = 0;
     if (cam->format_cap(&mask)) {
-        g_print("camera: formats supported:%s%s%s%s\n",
-                (mask & (1u << MV_FMT_RAW8))  ? " raw8"  : "",
-                (mask & (1u << MV_FMT_RAW10)) ? " raw10" : "",
-                (mask & (1u << MV_FMT_RAW12)) ? " raw12" : "",
-                (mask & (1u << MV_FMT_UYVY))  ? " uyvy"  : "");
+        GST_INFO("camera: formats supported:%s%s%s%s",
+                 (mask & (1u << MV_FMT_RAW8))  ? " raw8"  : "",
+                 (mask & (1u << MV_FMT_RAW10)) ? " raw10" : "",
+                 (mask & (1u << MV_FMT_RAW12)) ? " raw12" : "",
+                 (mask & (1u << MV_FMT_UYVY))  ? " uyvy"  : "");
     }
 
     double t = 0;
     if (cam->temperature_c(&t))
-        g_print("camera: sensor temperature %.1f C\n", t);
+        GST_INFO("camera: sensor temperature %.1f C", t);
     else
-        g_print("camera: sensor temperature not reported by this firmware\n");
+        GST_INFO("camera: sensor temperature not reported by this firmware");
 
     /* The whole ISP control word, because the three bits below share it and a surprise in one of them
        is easiest to recognise next to the others. All ones here would mean the read itself failed. */
     uint32_t isp = 0;
     if (cam->read32(MV_ISP_MODULE_CTRL, &isp))
-        g_print("camera: ISP control register 0x%08x\n", isp);
+        GST_INFO("camera: ISP control register 0x%08x", isp);
 
     int bit = 0;
     if (cam->get_isp_bit(MV_ISP_BIT_DPC, &bit))
-        g_print("camera: defect pixel correction %s\n", bit ? "on" : "off");
+        GST_INFO("camera: defect pixel correction %s", bit ? "on" : "off");
 
     uint32_t dpc = 0;
     if (cam->dpc_count(&dpc))
-        g_print("camera: register 0xC6C (DPC_Count in the vendor header, undocumented) = %u\n", dpc);
+        GST_INFO("camera: register 0xC6C (DPC_Count in the vendor header, undocumented) = %u", dpc);
 
     if (cam->get_isp_bit(MV_ISP_BIT_LUT, &bit))
-        g_print("camera: user LUT %s%s\n", bit ? "ON" : "off",
-                bit ? "  <- this alters pixel values on top of gamma" : "");
+        GST_INFO("camera: user LUT %s%s", bit ? "ON" : "off",
+                 bit ? "  <- this alters pixel values on top of gamma" : "");
 
     /* The enable bit alone is not enough to act on: gamma enabled at 1.00 changes nothing, while any
        other value is applied on top of whatever curve this element or cam-curve puts on, and would
@@ -910,27 +924,27 @@ static void mv_log_probe(MvCam *cam)
     if (cam->get_isp_bit(MV_ISP_BIT_GAMMA, &bit)) {
         double g = 0;
         if (cam->gamma_value(&g))
-            g_print("camera: internal gamma %s, value %.2f%s\n", bit ? "on" : "off", g,
-                    (bit && g != 1.0) ? "  <- applied on top of any curve set here" : "");
+            GST_INFO("camera: internal gamma %s, value %.2f%s", bit ? "on" : "off", g,
+                     (bit && g != 1.0) ? "  <- applied on top of any curve set here" : "");
         else
-            g_print("camera: internal gamma %s, value not readable\n", bit ? "on" : "off");
+            GST_INFO("camera: internal gamma %s, value not readable", bit ? "on" : "off");
     }
 
     uint32_t m = 0, bl = 0;
     cam->read32(MV_BLACK_LEVEL, &bl);
     if (cam->blc_mode(&m))
-        g_print("camera: black level register %u, correction mode %u (%s)\n", bl, m,
-                (m == 0) ? "automatic - the register is not applied, and the real pedestal can drift"
-                         : "manual - the register is what gets subtracted");
+        GST_INFO("camera: black level register %u, correction mode %u (%s)", bl, m,
+                 (m == 0) ? "automatic - the register is not applied, and the real pedestal can drift"
+                          : "manual - the register is what gets subtracted");
 
     uint32_t err = 0;
     if (cam->error_code(&err) && err)
-        g_printerr("camera: error code 0x%x\n", err);
+        GST_WARNING("camera: error code 0x%x", err);
 
     int us = 0;
     double db = 0;
     if (cam->get_exposure_us(&us) && cam->get_gain_db(&db))
-        g_print("camera: now exposing %d us at %.1f dB\n", us, db);
+        GST_INFO("camera: now exposing %d us at %.1f dB", us, db);
 
     /* What the auto loop is aiming at. Only interesting when it is running, but then it is the first
        thing to check: a daytime frame that comes out white usually means the target is at the vendor's
@@ -939,27 +953,27 @@ static void mv_log_probe(MvCam *cam)
     if (cam->read32(MV_EXPOSURE_MODE, &em) && cam->read32(MV_GAIN_MODE, &gm)
         && MvCam::implemented(em) && MvCam::implemented(gm)) {
         static const char *modes[] = { "manual", "auto once", "auto continuous" };
-        g_print("camera: exposure %s, gain %s\n",
-                (em < 3) ? modes[em] : "?", (gm < 3) ? modes[gm] : "?");
+        GST_INFO("camera: exposure %s, gain %s",
+                 (em < 3) ? modes[em] : "?", (gm < 3) ? modes[gm] : "?");
 
         if (em || gm) {
             uint32_t tgt = 0, aemax = 0, agmax = 0, roion = 0;
             if (cam->read32(MV_AE_TARGET, &tgt) && MvCam::implemented(tgt))
-                g_print("camera: auto target %u of 255\n", tgt);
+                GST_INFO("camera: auto target %u of 255", tgt);
             if (cam->read32(MV_AE_MAX_TIME, &aemax) && MvCam::implemented(aemax))
-                g_print("camera: auto exposure ceiling %u us\n", aemax);
+                GST_INFO("camera: auto exposure ceiling %u us", aemax);
             if (cam->read32(MV_AG_MAX_GAIN, &agmax) && MvCam::implemented(agmax))
-                g_print("camera: auto gain ceiling %.1f dB\n", agmax/10.0);
+                GST_INFO("camera: auto gain ceiling %.1f dB", agmax/10.0);
 
             int ax = 0, ay = 0, aw = 0, ah = 0;
             bool have_roi = cam->get_aa_roi(&ax, &ay, &aw, &ah);
             if (cam->read32(MV_AAROI_ENABLE, &roion) && MvCam::implemented(roion)) {
                 if (roion && have_roi)
-                    g_print("camera: auto metering window %dx%d at %d,%d\n", aw, ah, ax, ay);
+                    GST_INFO("camera: auto metering window %dx%d at %d,%d", aw, ah, ax, ay);
                 else if (roion)
-                    g_print("camera: auto metering window on, but not readable\n");
+                    GST_INFO("camera: auto metering window on, but not readable");
                 else
-                    g_print("camera: auto metering reads the whole frame, corners included\n");
+                    GST_INFO("camera: auto metering reads the whole frame, corners included");
             }
         }
     }
@@ -979,7 +993,7 @@ static gboolean mv_upload_curve(GstMipiMvSrc *src, float B, float D, float SP)
 {
     uint32_t count = 0;
     if (!src->i2c->lut_count(&count) || count < 2 || count > 65536) {
-        g_printerr("camera: LUT size came back as %u, not uploading a curve\n", count);
+        GST_ERROR("camera: LUT size came back as %u, not uploading a curve", count);
         return FALSE;
     }
 
@@ -1025,15 +1039,15 @@ static gboolean mv_upload_curve(GstMipiMvSrc *src, float B, float D, float SP)
     } else {
 
         /* Linear is what the camera already does, so there would be nothing to upload. */
-        g_printerr("camera: trans=lin is what the camera does anyway, not uploading a curve\n");
+        GST_WARNING("camera: trans=lin is what the camera does anyway, not uploading a curve");
         g_free(tbl);
         return FALSE;
     }
 
     /* The transfer is paced at 1 ms per register because the camera needs it, so this takes a couple of
        seconds. Say so, otherwise it looks like the pipeline has hung. */
-    g_print("camera: uploading a %u entry curve, this takes about %.1f s\n",
-            count, 0.5 + 0.001*count/2);
+    GST_INFO("camera: uploading a %u entry curve, this takes about %.1f s",
+             count, 0.5 + 0.001*count/2);
 
     #undef BIN_CENTRE
 
@@ -1043,7 +1057,7 @@ static gboolean mv_upload_curve(GstMipiMvSrc *src, float B, float D, float SP)
     g_free(tbl);
 
     if (!ok) {
-        g_printerr("camera: LUT upload failed: %s\n", src->i2c->error().c_str());
+        GST_ERROR("camera: LUT upload failed: %s", src->i2c->error().c_str());
         return FALSE;
     }
 
@@ -1054,9 +1068,9 @@ static gboolean mv_upload_curve(GstMipiMvSrc *src, float B, float D, float SP)
 
     /* The measured time, not the estimate, because this is the largest single thing a start() does
        and anything that reads an absolute timestamp downstream has to account for it. */
-    g_print("camera: uploaded a %u entry %s curve and enabled it, took %.2f s\n", count,
-            (src->trans == TRANS_GHS) ? "GHS" : (src->trans == TRANS_GAMMA) ? "gamma" : "lsb",
-            upload_s);
+    GST_INFO("camera: uploaded a %u entry %s curve and enabled it, took %.2f s", count,
+             (src->trans == TRANS_GHS) ? "GHS" : (src->trans == TRANS_GAMMA) ? "gamma" : "lsb",
+             upload_s);
 
     /* The host must now stop curving, and that is not optional. The uploaded table already folds in
        black-level, so the camera's output has black at zero; applying the host curve on top subtracts
@@ -1101,8 +1115,8 @@ static gboolean mv_setup_camera(GstMipiMvSrc *src)
         if (src->probe)                  g_string_append(ignored, " probe");
 
         if (ignored->len)
-            g_printerr("mipimvsrc: i2c-bus is -1, so the camera is left alone and these were "
-                       "ignored:%s. Add i2c-bus=-2 to apply them.\n", ignored->str);
+            GST_WARNING("mipimvsrc: i2c-bus is -1, so the camera is left alone and these were "
+                        "ignored:%s. Add i2c-bus=-2 to apply them.", ignored->str);
 
         g_string_free(ignored, TRUE);
         return TRUE;
@@ -1122,7 +1136,7 @@ static gboolean mv_setup_camera(GstMipiMvSrc *src)
         bus = MvCam::detect_bus_for_video(src->device, src->i2c_addr);
 
         if (bus >= 0) {
-            g_print("camera: %s is fed by the camera on bus %d\n", src->device, bus);
+            GST_INFO("camera: %s is fed by the camera on bus %d", src->device, bus);
         } else {
             /* No media graph to follow, so fall back to looking for a camera anywhere, which can only
                be trusted when there is exactly one. */
@@ -1130,32 +1144,32 @@ static gboolean mv_setup_camera(GstMipiMvSrc *src)
             bus = MvCam::detect_bus(src->i2c_addr, &n);
 
             if (bus == MVCAM_DETECT_AMBIGUOUS) {
-                g_printerr("camera: %d cameras on this board and the media graph did not say which "
-                           "one feeds %s. Give the bus number explicitly.\n", n, src->device);
+                GST_ERROR("camera: %d cameras on this board and the media graph did not say which "
+                            "one feeds %s. Give the bus number explicitly.", n, src->device);
                 return FALSE;
             }
             if (bus == MVCAM_DETECT_NONE) {
-                g_print("camera: no veye_mvcam found, continuing without camera control\n");
+                GST_INFO("camera: no veye_mvcam found, continuing without camera control");
                 return TRUE;
             }
-            g_print("camera: detected on bus %d\n", bus);
+            GST_INFO("camera: detected on bus %d", bus);
         }
     }
 
     src->i2c = new MvCam();
     if (!src->i2c->open(bus, src->i2c_addr)) {
-        g_printerr("camera: %s\n", src->i2c->error().c_str());
+        GST_WARNING("camera: %s", src->i2c->error().c_str());
         delete src->i2c;
         src->i2c = NULL;
         /* Usually a permissions problem: the user needs to be in the i2c group. Worth saying out
            loud, but not worth refusing to capture over when it was only autodetection asking. */
         if (detecting) {
-            g_print("camera: continuing without camera control\n");
+            GST_INFO("camera: continuing without camera control");
             return TRUE;
         }
         return FALSE;
     }
-    g_print("camera: control on /dev/i2c-%d at 0x%02x\n", bus, src->i2c_addr);
+    GST_INFO("camera: control on /dev/i2c-%d at 0x%02x", bus, src->i2c_addr);
 
     if (src->probe)
         mv_log_probe(src->i2c);
@@ -1172,19 +1186,19 @@ static gboolean mv_setup_camera(GstMipiMvSrc *src)
     int rx = 0, ry = 0, rw = 0, rh = 0;
     if (src->i2c->get_roi(&rx, &ry, &rw, &rh) && rw > 0 && rh > 0) {
 
-        g_print("camera: ROI %dx%d at %d,%d\n", rw, rh, rx, ry);
+        GST_INFO("camera: ROI %dx%d at %d,%d", rw, rh, rx, ry);
 
         if (!src->width_set && !src->height_set) {
             if (rw != src->width || rh != src->height)
-                g_print("camera: taking the frame size from the camera: %dx%d\n", rw, rh);
+                GST_INFO("camera: taking the frame size from the camera: %dx%d", rw, rh);
             src->width = rw;
             src->height = rh;
 
         } else if (rw != src->width || rh != src->height) {
-            g_printerr("camera: ROI is %dx%d but width/height say %dx%d. Fix the "
-                       "media_setting_rpi5.sh call, or drop width and height and let this element "
-                       "read them; unpacking a mismatched size shears the image.\n",
-                       rw, rh, src->width, src->height);
+            GST_WARNING("camera: ROI is %dx%d but width/height say %dx%d. Fix the "
+                        "media_setting_rpi5.sh call, or drop width and height and let this element "
+                        "read them; unpacking a mismatched size shears the image.",
+                        rw, rh, src->width, src->height);
         }
     }
 
@@ -1197,9 +1211,9 @@ static gboolean mv_setup_camera(GstMipiMvSrc *src)
     if (want_fps > 0.0) {
         double got = 0;
         if (src->i2c->set_framerate(want_fps, &got))
-            g_print("camera: frame rate %.2f -> %.2f fps\n", want_fps, got);
+            GST_INFO("camera: frame rate %.2f -> %.2f fps", want_fps, got);
         else
-            g_printerr("camera: frame rate failed: %s\n", src->i2c->error().c_str());
+            GST_WARNING("camera: frame rate failed: %s", src->i2c->error().c_str());
     }
 
     /* Modes before values: writing a manual exposure while the camera is in auto mode is accepted and
@@ -1308,8 +1322,8 @@ static void mv_rebuild_host_lut_if_running(GstMipiMvSrc *src)
        disturbed, or the frame gets curved twice. Say so rather than appearing to accept the change:
        the curve has to be set before the stream starts, because it is uploaded once. */
     if (src->curve_in_camera) {
-        g_printerr("camera: the curve is in the camera, so changing it while running has no effect - "
-                   "set it before starting the pipeline\n");
+        GST_WARNING("camera: the curve is in the camera, so changing it while running has no effect - "
+                    "set it before starting the pipeline");
         return;
     }
 
@@ -1373,27 +1387,27 @@ static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
         for (int i = 0; i < src->lut_size; i++)
             src->lut[i] = (unsigned char)MIN(i/div, 255);
 
-        g_print("camera: curve is in the camera, so this element only takes the top 8 bits%s\n",
-                (src->format == FORMAT_GRAY8) ? " (a straight copy)" : "");
+        GST_INFO("camera: curve is in the camera, so this element only takes the top 8 bits%s",
+                 (src->format == FORMAT_GRAY8) ? " (a straight copy)" : "");
 
         if (src->format != FORMAT_GRAY8)
-            g_print("camera: set the camera to Mono8 and format=GRAY8 to also drop the unpacking "
-                    "and halve the MIPI payload\n");
+            GST_INFO("camera: set the camera to Mono8 and format=GRAY8 to also drop the unpacking "
+                     "and halve the MIPI payload");
     }
 
     src->cap = new cv::VideoCapture();
 
     if (is_number(src->device)) {
         int index = atoi(src->device);
-        g_print("Opening camera index: %d\n", index);
+        GST_INFO("Opening camera index: %d", index);
         src->cap->open(index, cv::CAP_V4L2);
     } else {
-        g_print("Opening device path: %s\n", src->device);
+        GST_INFO("Opening device path: %s", src->device);
         src->cap->open(src->device, cv::CAP_V4L2);
     }
 
     if (!src->cap->isOpened()) {
-        g_printerr("ERROR! Unable to open camera\n");
+        GST_ERROR("unable to open the camera");
         delete src->cap;
         src->cap = NULL;
         return FALSE;
@@ -1422,13 +1436,13 @@ static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
         int want = src->n_buffers;
 
         if (want > OPENCV_MAX_V4L_BUFFERS) {
-            g_warning("mipimvsrc: OpenCV allows at most %d driver buffers, asking for %d instead of %d",
-                      OPENCV_MAX_V4L_BUFFERS, OPENCV_MAX_V4L_BUFFERS, want);
+            GST_WARNING("mipimvsrc: OpenCV allows at most %d driver buffers, asking for %d instead of %d",
+                        OPENCV_MAX_V4L_BUFFERS, OPENCV_MAX_V4L_BUFFERS, want);
             want = OPENCV_MAX_V4L_BUFFERS;
         }
 
         if (!src->cap->set(cv::CAP_PROP_BUFFERSIZE, want))
-            g_warning("mipimvsrc: driver kept its own buffer count, %d not applied", want);
+            GST_WARNING("mipimvsrc: driver kept its own buffer count, %d not applied", want);
     }
 
     /* With the curve in the camera the host table is the plain top-8-bits ramp, which is exactly what
@@ -1443,8 +1457,8 @@ static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
 
     gst_base_src_set_format(basesrc, GST_FORMAT_TIME);
 
-    g_print("mipimvsrc: start took %.2f s, all of it inside the PAUSED transition\n",
-            (g_get_monotonic_time() - start_begin)/1e6);
+    GST_INFO("mipimvsrc: start took %.2f s, all of it inside the PAUSED transition",
+             (g_get_monotonic_time() - start_begin)/1e6);
 
     return TRUE;
 }
@@ -1473,15 +1487,18 @@ static gboolean gst_mipimv_src_stop(GstBaseSrc *basesrc)
         if (src->fc_valid && src->i2c->frame_counts(&sns, &out)) {
             guint32 produced = sns - src->fc_sensor0;
             guint32 sent = out - src->fc_out0;
-            g_print("camera: produced %u frames, sent %u", produced, sent);
+            /* One call, because each log line is one message: a sentence assembled from three
+               prints came out as three lines once these went through GStreamer's logging. */
             if (produced > sent)
-                g_print(", DROPPED %u inside the camera", produced - sent);
-            g_print("\n");
+                GST_WARNING("camera: produced %u frames, sent %u, DROPPED %u inside the camera",
+                            produced, sent, produced - sent);
+            else
+                GST_INFO("camera: produced %u frames, sent %u", produced, sent);
         }
 
         uint32_t err = 0;
         if (src->i2c->error_code(&err) && err)
-            g_printerr("camera: error code 0x%x at stop\n", err);
+            GST_WARNING("camera: error code 0x%x at stop", err);
 
         delete src->i2c;
         src->i2c = NULL;
@@ -1731,7 +1748,7 @@ static GstFlowReturn gst_mipimv_src_create(GstPushSrc *pushsrc, GstBuffer **buf)
             if (src->unlocked)
                 return GST_FLOW_FLUSHING;
 
-            g_printerr("mipimvsrc: empty frame\n");
+            GST_ERROR("mipimvsrc: empty frame");
             return GST_FLOW_ERROR;
         }
 
@@ -1760,17 +1777,17 @@ static GstFlowReturn gst_mipimv_src_create(GstPushSrc *pushsrc, GstBuffer **buf)
         stale_age_ms = age_ms;
 
         if (++stale_skipped >= MV_MAX_STALE_SKIP) {
-            g_printerr("mipimvsrc: still getting frames %.0f ms old after discarding %d of them, "
-                       "taking this one - expect a gap in the timestamps\n",
-                       age_ms, stale_skipped);
+            GST_WARNING("mipimvsrc: still getting frames %.0f ms old after discarding %d of them, "
+                        "taking this one - expect a gap in the timestamps",
+                        age_ms, stale_skipped);
             break;
         }
     }
 
     if (stale_skipped > 0)
-        g_print("mipimvsrc: discarded %d frame%s left in the driver queue from before the stream "
-                "started, the oldest %.0f ms stale\n",
-                stale_skipped, (stale_skipped == 1) ? "" : "s", stale_age_ms);
+        GST_INFO("mipimvsrc: discarded %d frame%s left in the driver queue from before the stream "
+                 "started, the oldest %.0f ms stale",
+                 stale_skipped, (stale_skipped == 1) ? "" : "s", stale_age_ms);
 
     /* Timestamp before unpacking. Anything measured afterwards carries the conversion time as jitter,
        and the driver's own stamp avoids even that, since the kernel takes it when the frame lands. */
@@ -1781,8 +1798,8 @@ static GstFlowReturn gst_mipimv_src_create(GstPushSrc *pushsrc, GstBuffer **buf)
        turn out to report nothing - and by the time that is known the moment to measure has passed. */
     if (src->frame_count == 0) {
         src->base_pts = mv_running_time(src);
-        g_print("mipimvsrc: first frame %.3f s after the pipeline started, anchoring timestamps "
-                "there\n", (double)src->base_pts/GST_SECOND);
+        GST_INFO("mipimvsrc: first frame %.3f s after the pipeline started, anchoring timestamps "
+                 "there", (double)src->base_pts/GST_SECOND);
     }
 
     if (src->stamps == STAMP_DRIVER) {
@@ -1803,8 +1820,8 @@ static GstFlowReturn gst_mipimv_src_create(GstPushSrc *pushsrc, GstBuffer **buf)
                 pts = src->base_pts + (GstClockTime)(rel_ms*GST_MSECOND);
 
         } else if (src->frame_count == 0) {
-            g_warning("mipimvsrc: driver reports no capture time, falling back to the frame counter. "
-                      "Set stamps=clock if that suits the pipeline better.");
+            GST_WARNING("mipimvsrc: driver reports no capture time, falling back to the frame counter. "
+                        "Set stamps=clock if that suits the pipeline better.");
         }
 
     } else if (src->stamps == STAMP_CLOCK) {
@@ -1841,9 +1858,9 @@ static GstFlowReturn gst_mipimv_src_create(GstPushSrc *pushsrc, GstBuffer **buf)
     const gsize need = (gsize)packed_line_bytes(src->width, src->format)*src->height;
 
     if (got < need) {
-        g_printerr("mipimvsrc: frame is %" G_GSIZE_FORMAT " bytes, need at least %" G_GSIZE_FORMAT
-                   " for %dx%d. Check format and resolution.\n",
-                   got, need, src->width, src->height);
+        GST_WARNING("mipimvsrc: frame is %" G_GSIZE_FORMAT " bytes, need at least %" G_GSIZE_FORMAT
+                    " for %dx%d. Check format and resolution.",
+                    got, need, src->width, src->height);
         gst_buffer_unmap(*buf, &map);
         gst_buffer_unref(*buf);
         *buf = NULL;
@@ -2238,6 +2255,9 @@ static void gst_mipimv_src_init(GstMipiMvSrc *src)
 
 static gboolean plugin_init(GstPlugin *plugin)
 {
+    GST_DEBUG_CATEGORY_INIT(mipimvsrc_debug, "mipimvsrc", 0,
+                            "MIPI machine vision camera source");
+
     gboolean ok = gst_element_register(plugin, "mipimvsrc", GST_RANK_NONE, gst_mipimv_src_get_type());
     return ok;
 }

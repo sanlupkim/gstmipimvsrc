@@ -58,6 +58,33 @@ gst-inspect-1.0 -b            # lists blacklisted plugins
 A plugin can also be shadowed by an older copy: `gst-inspect-1.0 mipimvsrc | grep Filename` says which
 file is actually in use, and `GST_PLUGIN_PATH` can be pointing somewhere else entirely.
 
+## Logging
+
+Everything this element has to say goes through GStreamer's logging, in a category named
+`mipimvsrc`, rather than to stdout. That matters under RMS, which installs a GStreamer log handler
+and routes it into its own log file: a message sent this way lands beside the rest of the capture
+log, while one printed to stdout lands wherever the launcher pointed stdout, which for a service is
+usually nowhere. Chasing a startup problem through a log that does not contain the element's own
+account of the startup is not a good use of an evening.
+
+Levels are set against RMS's default threshold of 2, which is WARNING:
+
+| level | what goes there |
+|---|---|
+| `GST_ERROR` | the element is giving up: no camera, a failed curve upload, an empty frame |
+| `GST_WARNING` | acted on without being asked for: a clamped value, a mismatched ROI, a discarded stale frame, a register the firmware does not implement |
+| `GST_INFO` | the running commentary: what was set and what the camera took, frame size, startup timings |
+
+So the first two appear in the RMS log as they are. For the rest:
+
+```sh
+GST_DEBUG=2,mipimvsrc:4
+```
+
+A bare number in `GST_DEBUG` is the default for every category and `category:level` raises one, so
+this keeps everything else quiet. RMS needs the fix in `BufferedCapture` that parses this form -
+before it, `int()` of the whole string threw and took the log handler registration with it.
+
 ## Properties
 
 | property | default | what it does |
