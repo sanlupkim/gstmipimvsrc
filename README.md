@@ -208,6 +208,9 @@ conversion; the simplest arrangement today is a second pipeline for the occasion
 scheduled, so it neither drifts nor jitters. Use it.
 
 The first frame is anchored to the pipeline's running time rather than to zero, and that detail matters.
+The anchor is applied to every stamp mode that counts from the first frame - the driver's stamps and the
+frame-counter fallback alike - because which one ends up supplying the timestamp is not known until the
+driver has been asked, by which time the moment to measure has gone.
 The camera can take seconds to deliver frame one - starting the stream, settling the sensor, and with
 `cam-curve` also the two and a half second LUT transfer - and a PTS of zero hands all of that back as a
 constant error in every absolute timestamp downstream. RMS computes its frame time as

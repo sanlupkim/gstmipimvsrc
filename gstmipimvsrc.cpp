@@ -107,10 +107,12 @@ typedef struct _GstMipiMvSrc {
     MvStamp stamps;
     double first_driver_ms;
 
-    /* Running time of the pipeline when the first frame arrived. The driver's own stamps give perfect
-       intervals but start counting from whenever the camera happened to deliver frame one, so without
-       this anchor the whole session is reported as that much earlier than it was. */
-    GstClockTime driver_base_pts;
+    /* Running time of the pipeline when the first frame arrived, added to every timestamp that is
+       otherwise relative to the first frame - the driver's stamps and the frame-counter fallback both
+       start from whatever moment the camera happened to deliver frame one. Without this anchor the
+       whole session is reported as that much earlier than it really was, and RMS, which computes its
+       frame time as start_timestamp + pts, reports "Buffer fill: 100%" for the rest of the night. */
+    GstClockTime base_pts;
 
     /* Set when the transform happens to be "keep the top 8 bits", which has a much cheaper path. */
     gboolean high_byte_only;
@@ -1301,6 +1303,30 @@ static void mv_rebuild_host_lut_if_running(GstMipiMvSrc *src)
 }
 
 
+/* The pipeline's running time now, or 0 if there is no clock to ask. Live sources do not preroll, so
+ * by the time a frame is produced the element is in PLAYING and has one; the zero is for safety, not
+ * for an expected case.
+ */
+static GstClockTime mv_running_time(GstMipiMvSrc *src)
+{
+    GstClockTime rt = 0;
+
+    GstClock *clock = gst_element_get_clock(GST_ELEMENT(src));
+
+    if (clock) {
+        GstClockTime now = gst_clock_get_time(clock);
+        GstClockTime base = gst_element_get_base_time(GST_ELEMENT(src));
+
+        if (GST_CLOCK_TIME_IS_VALID(now) && GST_CLOCK_TIME_IS_VALID(base) && now >= base)
+            rt = now - base;
+
+        gst_object_unref(clock);
+    }
+
+    return rt;
+}
+
+
 static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
 {
     GstMipiMvSrc *src = (GstMipiMvSrc *)basesrc;
@@ -1312,7 +1338,7 @@ static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
     /* Reset per start, so a pipeline cycling through READY re-anchors instead of reusing the offset
        from the previous run. */
     src->first_driver_ms = -1.0;
-    src->driver_base_pts = 0;
+    src->base_pts = 0;
 
     if (!mv_setup_camera(src))
         return FALSE;
@@ -1394,6 +1420,7 @@ static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
     src->duration = gst_util_uint64_scale_int(GST_SECOND, src->fps_d, src->fps_n);
     src->frame_count = 0;
     src->first_driver_ms = -1.0;
+    src->base_pts = 0;
 
     gst_base_src_set_format(basesrc, GST_FORMAT_TIME);
     return TRUE;
@@ -1678,6 +1705,15 @@ static GstFlowReturn gst_mipimv_src_create(GstPushSrc *pushsrc, GstBuffer **buf)
        and the driver's own stamp avoids even that, since the kernel takes it when the frame lands. */
     GstClockTime pts = GST_CLOCK_TIME_NONE;
 
+    /* Taken before anything else, and for every stamp mode, because two of the three produce times
+       relative to the first frame. Which one supplies the timestamp is not known yet - the driver may
+       turn out to report nothing - and by the time that is known the moment to measure has passed. */
+    if (src->frame_count == 0) {
+        src->base_pts = mv_running_time(src);
+        g_print("mipimvsrc: first frame %.3f s after the pipeline started, anchoring timestamps "
+                "there\n", (double)src->base_pts/GST_SECOND);
+    }
+
     if (src->stamps == STAMP_DRIVER) {
 
         const double ms = src->cap->get(cv::CAP_PROP_POS_MSEC);
@@ -1685,35 +1721,15 @@ static GstFlowReturn gst_mipimv_src_create(GstPushSrc *pushsrc, GstBuffer **buf)
         // Some drivers leave this at zero, in which case there is nothing to use
         if (ms > 0.0) {
 
-            if (src->first_driver_ms < 0.0) {
+            if (src->first_driver_ms < 0.0)
                 src->first_driver_ms = ms;
 
-                /* Anchor the first frame to where the pipeline actually is, rather than to zero. The
-                   camera can take seconds to deliver frame one - starting the stream, settling the
-                   sensor, and with cam-curve also the LUT transfer - and a PTS of zero hands all of
-                   that back as a constant error in every absolute timestamp downstream. RMS computes
-                   its frame time as start_timestamp + pts, so the whole night came out early and its
-                   "Buffer fill" reading sat at 100%. The driver's deltas still carry the intervals,
-                   which is the reason to use its stamps in the first place. */
-                src->driver_base_pts = 0;
-
-                GstClock *clock = gst_element_get_clock(GST_ELEMENT(src));
-                if (clock) {
-                    GstClockTime now = gst_clock_get_time(clock);
-                    GstClockTime base = gst_element_get_base_time(GST_ELEMENT(src));
-                    if (GST_CLOCK_TIME_IS_VALID(now) && GST_CLOCK_TIME_IS_VALID(base) && now >= base)
-                        src->driver_base_pts = now - base;
-                    gst_object_unref(clock);
-                }
-
-                g_print("mipimvsrc: first frame %.3f s after the pipeline started, anchoring the "
-                        "driver timestamps there\n", (double)src->driver_base_pts/GST_SECOND);
-            }
-
+            /* The driver's deltas carry the intervals, which is the reason to use its stamps at all.
+               Only the origin comes from the anchor above. */
             const double rel_ms = ms - src->first_driver_ms;
 
             if (rel_ms >= 0.0)
-                pts = src->driver_base_pts + (GstClockTime)(rel_ms*GST_MSECOND);
+                pts = src->base_pts + (GstClockTime)(rel_ms*GST_MSECOND);
 
         } else if (src->frame_count == 0) {
             g_warning("mipimvsrc: driver reports no capture time, falling back to the frame counter. "
@@ -1722,21 +1738,15 @@ static GstFlowReturn gst_mipimv_src_create(GstPushSrc *pushsrc, GstBuffer **buf)
 
     } else if (src->stamps == STAMP_CLOCK) {
 
-        GstClock *clock = gst_element_get_clock(GST_ELEMENT(src));
-
-        if (clock) {
-            GstClockTime now = gst_clock_get_time(clock);
-            GstClockTime base = gst_element_get_base_time(GST_ELEMENT(src));
-
-            if (GST_CLOCK_TIME_IS_VALID(now) && GST_CLOCK_TIME_IS_VALID(base) && now >= base)
-                pts = now - base;
-
-            gst_object_unref(clock);
-        }
+        /* Already an absolute running time, so it needs no anchor - it is what the anchor is made of. */
+        pts = mv_running_time(src);
     }
 
+    /* The frame counter is the last resort, for a driver that stamps nothing. It needs the anchor
+       just as much: counting frames from zero puts the first frame at the moment the pipeline started
+       rather than at the moment it arrived, which is the error this whole anchor exists to remove. */
     if (!GST_CLOCK_TIME_IS_VALID(pts))
-        pts = src->frame_count*src->duration;
+        pts = src->base_pts + src->frame_count*src->duration;
 
     src->frame_count++;
 
@@ -2121,7 +2131,7 @@ static void gst_mipimv_src_init(GstMipiMvSrc *src)
     src->black_level = 0;
     src->stamps = STAMP_DRIVER;
     src->first_driver_ms = -1.0;
-    src->driver_base_pts = 0;
+    src->base_pts = 0;
     src->frame_count = 0;
 
     /* Camera control off by default: a bus of -1 means this element never touches I2C, so existing
