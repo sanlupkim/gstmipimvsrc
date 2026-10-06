@@ -31,6 +31,15 @@
    is 4). Asking for more releases the buffers it had and then refuses, leaving capture dead. */
 #define OPENCV_MAX_V4L_BUFFERS 10
 
+/* A frame older than this when it reaches us was sitting in the driver's queue rather than being
+   captured for us. Several frame intervals, so ordinary queue latency never trips it. */
+#define MV_STALE_FRAMES 5
+
+/* How many stale frames to discard before giving up and taking what there is. The driver queue holds
+   at most OPENCV_MAX_V4L_BUFFERS, so anything beyond a few times that is a different problem and not
+   one to spin on. */
+#define MV_MAX_STALE_SKIP 32
+
 #include "mvcam.h"
 using namespace cv;
 using namespace std;
@@ -1028,7 +1037,9 @@ static gboolean mv_upload_curve(GstMipiMvSrc *src, float B, float D, float SP)
 
     #undef BIN_CENTRE
 
+    const gint64 upload_start = g_get_monotonic_time();
     gboolean ok = src->i2c->upload_lut(tbl, (int)count);
+    const double upload_s = (g_get_monotonic_time() - upload_start)/1e6;
     g_free(tbl);
 
     if (!ok) {
@@ -1041,8 +1052,11 @@ static gboolean mv_upload_curve(GstMipiMvSrc *src, float B, float D, float SP)
     src->i2c->set_gamma_enable(0);
     src->i2c->set_lut_enable(1);
 
-    g_print("camera: uploaded a %u entry %s curve and enabled it\n", count,
-            (src->trans == TRANS_GHS) ? "GHS" : (src->trans == TRANS_GAMMA) ? "gamma" : "lsb");
+    /* The measured time, not the estimate, because this is the largest single thing a start() does
+       and anything that reads an absolute timestamp downstream has to account for it. */
+    g_print("camera: uploaded a %u entry %s curve and enabled it, took %.2f s\n", count,
+            (src->trans == TRANS_GHS) ? "GHS" : (src->trans == TRANS_GAMMA) ? "gamma" : "lsb",
+            upload_s);
 
     /* The host must now stop curving, and that is not optional. The uploaded table already folds in
        black-level, so the camera's output has black at zero; applying the host curve on top subtracts
@@ -1331,6 +1345,11 @@ static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
 {
     GstMipiMvSrc *src = (GstMipiMvSrc *)basesrc;
 
+    /* Timed end to end and reported, because everything this function spends happens inside the
+       PAUSED transition, before the pipeline's base time exists. Anything downstream that anchors
+       absolute time on the start of that transition charges this to every frame of the session. */
+    const gint64 start_begin = g_get_monotonic_time();
+
     mv_build_host_lut(src);
 
     /* Before the device: the sensor format and ROI decide the byte layout the capture side will see,
@@ -1423,6 +1442,10 @@ static gboolean gst_mipimv_src_start(GstBaseSrc *basesrc)
     src->base_pts = 0;
 
     gst_base_src_set_format(basesrc, GST_FORMAT_TIME);
+
+    g_print("mipimvsrc: start took %.2f s, all of it inside the PAUSED transition\n",
+            (g_get_monotonic_time() - start_begin)/1e6);
+
     return TRUE;
 }
 
@@ -1688,18 +1711,66 @@ static GstFlowReturn gst_mipimv_src_create(GstPushSrc *pushsrc, GstBuffer **buf)
     if (src->unlocked)
         return GST_FLOW_FLUSHING;
 
-    if (!src->cap->read(src->frame) || src->frame.empty()) {
+    /* A camera that was already streaming while the pipeline was still starting up leaves frames in
+       the driver's queue, and the first read returns the OLDEST of them. Taking that one as the origin
+       is worse than it sounds: the next frame is genuinely current, so its driver timestamp jumps by
+       however long the stale one had been waiting, and everything downstream reads that as a gap. Seen
+       on an IMX178 whose first frame was 12.4 s old, which RMS counted as 311 dropped frames in the
+       first block.
 
-        // A read that comes back empty because the pipeline is stopping is not an error
+       So at startup, discard frames that were captured long before they were handed over. Only until
+       the first one is accepted - after that a late frame is news, not noise, and must be passed on. */
+    int stale_skipped = 0;
+    double stale_age_ms = 0.0;
+
+    for (;;) {
+
+        if (!src->cap->read(src->frame) || src->frame.empty()) {
+
+            // A read that comes back empty because the pipeline is stopping is not an error
+            if (src->unlocked)
+                return GST_FLOW_FLUSHING;
+
+            g_printerr("mipimvsrc: empty frame\n");
+            return GST_FLOW_ERROR;
+        }
+
         if (src->unlocked)
             return GST_FLOW_FLUSHING;
 
-        g_printerr("mipimvsrc: empty frame\n");
-        return GST_FLOW_ERROR;
+        if (src->frame_count > 0)
+            break;
+
+        const double capture_ms = src->cap->get(cv::CAP_PROP_POS_MSEC);
+
+        if (capture_ms <= 0.0)
+            break;                      /* no capture time to judge it by */
+
+        /* Both are CLOCK_MONOTONIC - the V4L2 buffer timestamp and GLib's monotonic clock - so the
+           difference is meaningful. If it is not, the two are not the clocks assumed here and the
+           figure must not be acted on. */
+        const double age_ms = g_get_monotonic_time()/1000.0 - capture_ms;
+
+        if (!(age_ms >= 0.0 && age_ms < 60000.0))
+            break;
+
+        if (age_ms < MV_STALE_FRAMES*1000.0*src->fps_d/src->fps_n)
+            break;                      /* fresh enough */
+
+        stale_age_ms = age_ms;
+
+        if (++stale_skipped >= MV_MAX_STALE_SKIP) {
+            g_printerr("mipimvsrc: still getting frames %.0f ms old after discarding %d of them, "
+                       "taking this one - expect a gap in the timestamps\n",
+                       age_ms, stale_skipped);
+            break;
+        }
     }
 
-    if (src->unlocked)
-        return GST_FLOW_FLUSHING;
+    if (stale_skipped > 0)
+        g_print("mipimvsrc: discarded %d frame%s left in the driver queue from before the stream "
+                "started, the oldest %.0f ms stale\n",
+                stale_skipped, (stale_skipped == 1) ? "" : "s", stale_age_ms);
 
     /* Timestamp before unpacking. Anything measured afterwards carries the conversion time as jitter,
        and the driver's own stamp avoids even that, since the kernel takes it when the frame lands. */

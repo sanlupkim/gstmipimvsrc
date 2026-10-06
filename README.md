@@ -202,6 +202,19 @@ mipimvsrc ... ! tee name=t \
 Note that a `tee` cannot give the two branches different formats, so this needs two elements or a
 conversion; the simplest arrangement today is a second pipeline for the occasional lossless capture.
 
+### Stale frames at startup
+
+A camera that was already streaming while the pipeline was still starting leaves frames in the driver's
+queue, and the first read returns the oldest of them. That one frame is worse than it looks: the next
+frame is genuinely current, so its driver timestamp jumps by however long the stale one waited, and
+anything downstream reads that jump as a gap. Measured on an IMX178 whose first frame arrived 12.4 s
+after it was captured, which RMS counted as 311 dropped frames in its first block.
+
+So until the first frame is accepted, frames captured more than five frame intervals before they were
+handed over are discarded, and the count is logged. After that a late frame is news rather than noise
+and is passed on unchanged. The judgement needs the V4L2 buffer timestamp and GLib's monotonic clock to
+be the same clock, which on Linux they are; when the arithmetic says otherwise the frame is kept.
+
 ### Timestamps
 
 `driver` takes the kernel's own capture time. Unaffected by how long this element waits to be
