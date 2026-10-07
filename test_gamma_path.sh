@@ -76,8 +76,13 @@ else:                                         # Y12P, 3 bytes per 2 pixels
 PY
 }
 
+# The format defaults to whatever the camera is in, because the exposure ladder runs before the format
+# loop has picked one. Defaulted rather than required: leaving it to the caller is how this went out
+# with one call passing a single argument, which under set -u killed the function and made the whole
+# ladder report "?".
 median() {
-    { unpack_py; echo 'print(int(np.median(f)))'; } | python3 - "$1" "$W" "$H" "$2"
+    local fmt="${2:-${WAS_FMT:-2}}"
+    { unpack_py; echo 'print(int(np.median(f)))'; } | python3 - "$1" "$W" "$H" "$fmt"
 }
 
 # Read a gamma value back as the camera holds it

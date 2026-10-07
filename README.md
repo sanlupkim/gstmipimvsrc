@@ -58,6 +58,21 @@ gst-inspect-1.0 -b            # lists blacklisted plugins
 A plugin can also be shadowed by an older copy: `gst-inspect-1.0 mipimvsrc | grep Filename` says which
 file is actually in use, and `GST_PLUGIN_PATH` can be pointing somewhere else entirely.
 
+## Testing the camera scripts without a camera
+
+`tests/run_test_gamma_path.sh` runs `test_gamma_path.sh` against a stubbed camera - a fake vendor tool
+holding register state and a fake `v4l2-ctl` generating frames in whatever format the stub is set to -
+and checks the verdict and that the camera was left exactly as found. No hardware, about ten seconds.
+
+The stub applies gamma only when reducing to 8 bits, which is what section 17 of the IMX178 analysis
+measured on real frames, so the expected result is RAW12 inert, RAW10 inert, RAW8 live.
+
+It exists because that script went to the station four times with a fault each time, and every one of
+them would have shown here: an exposure it never set, a verdict decided by sensor noise, a register
+value it never checked had been taken, a restore that invented a setting whose read it had failed to
+parse, and a call one argument short that `set -u` turned into a ladder of question marks. Run it
+before touching either camera script.
+
 ## Logging
 
 Everything this element has to say goes through GStreamer's logging, in a category named
