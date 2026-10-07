@@ -37,6 +37,7 @@ lutenable 1
 pixelformat 0
 metime 39906
 mgain 30.0
+roi 344,0,2400,2064
 EOF
 cp "$WORK/state" "$WORK/state.before"
 
@@ -64,6 +65,22 @@ if grep -q "GAMMA IS\|NO VERDICT" "$WORK/out.txt" \
     echo "  ok    every format reconfigured through the driver"
 else
     echo "  FAIL  a format could not be reconfigured"
+    fail=1
+fi
+
+# The media script must be called with the camera's own ROI and only the format varying. A broken ROI
+# read would show here rather than passing silently, which is what happened when the fake tool had no
+# roi field at all and the fake media script ignored its arguments.
+want_calls="mvcam -fmt RAW12 -x 344 -y 0 -w 2400 -h 2064 -c 1
+mvcam -fmt RAW10 -x 344 -y 0 -w 2400 -h 2064 -c 1
+mvcam -fmt RAW8 -x 344 -y 0 -w 2400 -h 2064 -c 1"
+
+if [ "$(grep -v 'RAW8 -x 344' "$WORK/media_calls" | head -2; grep -m1 'RAW8 -x 344' "$WORK/media_calls")" \
+     = "$want_calls" ]; then
+    echo "  ok    media script called with the camera's ROI, only -fmt varying"
+else
+    echo "  FAIL  unexpected media script calls:"
+    sed 's/^/        /' "$WORK/media_calls"
     fail=1
 fi
 

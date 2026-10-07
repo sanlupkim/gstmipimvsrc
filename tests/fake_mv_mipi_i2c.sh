@@ -17,5 +17,6 @@ case "$FIELD" in
   pixelformat)  [ "$MODE" = w ] && put pixelformat "$P1";  printf "r pixelformat is %d \n" "$(get pixelformat)";;
   metime)       [ "$MODE" = w ] && put metime "$P1";       printf "r manual exp time %d us \n" "$(get metime)";;
   mgain)        [ "$MODE" = w ] && put mgain "$P1";        printf "r manual gain %.1f dB \n" "$(get mgain)";;
+  roi)          printf "r roi is %s \n" "$(get roi)";;
   *) echo "unknown field $FIELD" >&2; exit 1;;
 esac
