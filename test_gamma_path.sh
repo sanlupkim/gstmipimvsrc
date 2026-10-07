@@ -179,6 +179,29 @@ WAS_LUT=$(i2c -r -f lutenable | grep -oE '[0-9]+' | tail -1)
 WAS_EXP=$(i2c -r -f metime | grep -oE '[0-9]+' | tail -1)
 WAS_GAIN=$(i2c -r -f mgain | grep -oE '[0-9]+\.[0-9]+' | tail -1)
 WAS_FMT=$(i2c -r -f pixelformat | grep -oE '[0-9]+' | tail -1)
+ROI=$(i2c -r -f roi | grep -oE '[0-9]+,[0-9]+,[0-9]+,[0-9]+' | tail -1)
+RX=${ROI%%,*}; R=${ROI#*,}; RY=${R%%,*}; R=${R#*,}; RW=${R%%,*}; RH=${R##*,}
+
+# Changing the pixel format is the driver's business, through media-ctl, because it configures the
+# CSI-2 receiver to match what the camera will send. Writing Pixel_Format over I2C changes only one
+# side of that and the frames come back unusable.
+MEDIA=${MEDIA_SCRIPT:-$MV/../rpi5_scripts/media_setting_rpi5.sh}
+CAM=${CAM:-1}
+
+fmt_name() { case $1 in 0) echo RAW8;; 1) echo RAW10;; 2) echo RAW12;; *) echo "fmt$1";; esac; }
+
+set_format() {
+    local want=$1 name
+    name=$(fmt_name "$want")
+
+    if [ ! -x "$MEDIA" ]; then
+        return 1
+    fi
+
+    "$MEDIA" mvcam -fmt "$name" -x "$RX" -y "$RY" -w "$RW" -h "$RH" -c "$CAM" >/dev/null 2>&1
+    sleep 1
+    [ "$(i2c -r -f pixelformat | grep -oE '[0-9]+' | tail -1)" = "$want" ]
+}
 echo "(will restore gammaenable=${WAS_EN:-0} gamma=${WAS_G:-1.00} lutenable=${WAS_LUT:-0}"
 echo "              metime=${WAS_EXP:-40000} mgain=${WAS_GAIN:-0.0})"
 
@@ -215,6 +238,17 @@ restore() {
     put_back lutenable   "${WAS_LUT:-}"
     put_back metime      "${WAS_EXP:-}"
     put_back mgain       "${WAS_GAIN:-}"
+
+    # The format goes back the way it was changed, through the driver
+    if [ -n "${WAS_FMT:-}" ] \
+       && [ "$(i2c -r -f pixelformat | grep -oE '[0-9]+' | tail -1)" != "$WAS_FMT" ]; then
+        if set_format "$WAS_FMT"; then
+            echo "    pixel format restored to $(fmt_name "$WAS_FMT")"
+        else
+            echo "    WARNING: could not restore the pixel format to $(fmt_name "$WAS_FMT")."
+            echo "             Run media_setting_rpi5.sh yourself before starting RMS."
+        fi
+    fi
 
     i2c -r -f gamma
     local en lut
@@ -311,23 +345,33 @@ fi
 RATIO=$(awk -v a="$G_LOW" -v b="$G_HIGH" 'BEGIN{printf "%.3f", b/a}')
 echo "    using ${G_LOW} and ${G_HIGH} (exponent ratio ${RATIO})"
 
-# Only the format the camera is ALREADY in, and the register is not touched. The driver owns the pixel
-# format: it writes Pixel_Format from the media-ctl configuration and sets up the CSI-2 receiver to
-# match. Writing the register behind its back changes what the camera sends without changing what the
-# receiver expects, and the frames come back unusable - median 0, no levels to compare, which is
-# exactly what the previous version reported for RAW12 and RAW10 while claiming to have tested them.
-#
-# To test another format, reconfigure properly first and run this again:
-#
-#     rpi5_scripts/media_setting_rpi5.sh mvcam -fmt RAW12 -x <x> -y <y> -w <w> -h <h> -c 1
-#
-FMT=$WAS_FMT
-NAME=$(case $FMT in 0) echo RAW8;; 1) echo RAW10;; 2) echo RAW12;; *) echo "fmt$FMT";; esac)
+# The answer is expected to differ per format - section 17 of the IMX178 analysis measured the stage
+# acting on the 8 bit reduction and not on 10 or 12 bit - so all three are worth covering. Each is
+# reconfigured through media_setting_rpi5.sh so the driver and the camera agree; the register is never
+# written directly, which is what made the previous version report a median of 0 for RAW12 and RAW10
+# while claiming to have tested them. FORMATS can narrow it, e.g. FORMATS=2 for 12 bit only.
+if [ ! -x "$MEDIA" ]; then
+    echo
+    echo "    $MEDIA not found or not executable, so the format cannot be changed safely."
+    echo "    Testing only $(fmt_name "$WAS_FMT"), the one the driver has. Point MEDIA_SCRIPT at it to"
+    echo "    cover the others, and set CAM if this camera is not -c $CAM."
+    FORMATS=${FORMATS:-$WAS_FMT}
+fi
 
-for once in 1; do
+for FMT in ${FORMATS:-2 1 0}; do
+
+    NAME=$(fmt_name "$FMT")
 
     echo
-    echo "================= $NAME (as the driver has it) ================="
+    echo "================= $NAME ================="
+
+    if [ "$FMT" != "$WAS_FMT" ] || [ -x "$MEDIA" ]; then
+        if ! set_format "$FMT"; then
+            echo "    could not reconfigure the driver for $NAME, skipping"
+            continue
+        fi
+        echo "    driver reconfigured: $NAME at ${RW}x${RH}+${RX}+${RY}"
+    fi
 
     set_gamma "$G_LOW" || { echo "    could not set gamma $G_LOW"; continue; }
     sleep 0.5

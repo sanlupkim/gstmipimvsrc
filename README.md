@@ -65,10 +65,14 @@ holding register state and a fake `v4l2-ctl` generating frames in whatever forma
 and checks the verdict and that the camera was left exactly as found. No hardware, about ten seconds.
 
 The stub applies gamma only when reducing to 8 bits, which is what section 17 of the IMX178 analysis
-measured on real frames, so the expected result is live in RAW8 and inert in RAW10 and RAW12. Each
-format is a separate run with the stub configured for it, because that is how it works on the camera:
-the driver owns the pixel format and the test tests the one the camera is already in. To cover another,
-reconfigure with `media_setting_rpi5.sh` and run it again.
+measured on real frames, so the expected result is live in RAW8 and inert in RAW10 and RAW12.
+
+One run covers all three. The test reconfigures each format through `media_setting_rpi5.sh`, which is
+the only correct way: the driver owns the pixel format and sets up the CSI-2 receiver from its own
+configuration, so writing `Pixel_Format` over I2C moves one side only and the frames unpack to nothing.
+It finds the script beside `mv_tools_rpi` and reads the ROI off the camera; `MEDIA_SCRIPT` and `CAM`
+override that, `FORMATS` narrows which to test, and the original format is put back at the end. Without
+the script it tests the format the camera is already in and says so.
 
 It exists because that script went to the station four times with a fault each time, and every one of
 them would have shown here: an exposure it never set, a verdict decided by sensor noise, a register

@@ -9,10 +9,12 @@
 # The stub applies gamma only when reducing to 8 bits, which is what section 17 of the IMX178 analysis
 # measured on real sunset frames. So the expected result is live in RAW8 and inert in RAW10 and RAW12.
 #
-# Each format is a separate run with the stub set to it, because that is how it works on the camera: the
-# driver owns the pixel format and the test may not change it. One run tests the one format the camera
-# is in. The previous version of both files ran a loop writing the register, which changed what the
-# camera sent without changing what the CSI receiver expected, and got frames that unpacked to nothing.
+# One run covers all three, because the script reconfigures through media_setting_rpi5.sh, which on the
+# Pi changes the driver and the camera together. The stub stands in for it. What the script must never
+# do is write Pixel_Format itself: that moves one side only and the frames unpack to nothing, which is
+# what an earlier version did while reporting it had tested them. The stub's fake v4l2-ctl honoured the
+# register back then, so it shared the mistake and could not catch it; now only the media stub moves
+# the format, and the harness asserts the script did not.
 #
 # Usage: tests/run_test_gamma_path.sh
 
@@ -25,63 +27,59 @@ trap 'rm -rf "$WORK"' EXIT
 cp "$HERE/fake_mv_mipi_i2c.sh" "$WORK/mv_mipi_i2c.sh"
 mkdir -p "$WORK/bin"
 cp "$HERE/bin/v4l2-ctl" "$WORK/bin/v4l2-ctl"
-chmod +x "$WORK/mv_mipi_i2c.sh" "$WORK/bin/v4l2-ctl"
+cp "$HERE/fake_media_setting.sh" "$WORK/media_setting.sh"
+chmod +x "$WORK/mv_mipi_i2c.sh" "$WORK/bin/v4l2-ctl" "$WORK/media_setting.sh"
 
-fail=0
-
-for case in "0 RAW8 LIVE" "1 RAW10 INERT" "2 RAW12 INERT"; do
-
-    set -- $case
-    fmt=$1 name=$2 want=$3
-
-    cat > "$WORK/state" <<EOF
+cat > "$WORK/state" <<'EOF'
 gammaenable 0
 gamma 0.80
 lutenable 1
-pixelformat $fmt
+pixelformat 0
 metime 39906
 mgain 30.0
 EOF
-    cp "$WORK/state" "$WORK/state.before"
+cp "$WORK/state" "$WORK/state.before"
 
-    LC_ALL=C PATH="$WORK/bin:$PATH" MV_TOOLS="$WORK" \
-        bash "$HERE/../test_gamma_path.sh" 4 /dev/video8 240 206 > "$WORK/out.txt" 2>&1
-    rc=$?
+LC_ALL=C PATH="$WORK/bin:$PATH" MV_TOOLS="$WORK" MEDIA_SCRIPT="$WORK/media_setting.sh" \
+    bash "$HERE/../test_gamma_path.sh" 4 /dev/video8 240 206 > "$WORK/out.txt" 2>&1
+rc=$?
 
-    echo "--- camera configured for $name (exit $rc) ---"
-    [ $rc -eq 0 ] || { echo "  FAIL  non zero exit"; fail=1; }
+fail=0
+echo "exit code $rc"
+[ $rc -eq 0 ] || fail=1
 
-    if grep -qF "$name: GAMMA IS $want" "$WORK/out.txt"; then
-        echo "  ok    $name: GAMMA IS $want"
+for want in "RAW12: GAMMA IS INERT" "RAW10: GAMMA IS INERT" "RAW8: GAMMA IS LIVE"; do
+    if grep -qF "$want" "$WORK/out.txt"; then
+        echo "  ok    $want"
     else
-        echo "  FAIL  expected $name: GAMMA IS $want"
-        grep -E "GAMMA IS|NO VERDICT" "$WORK/out.txt" | sed 's/^/        got: /'
+        echo "  FAIL  expected: $want"
         fail=1
     fi
-
-    # The format may not be touched: the driver owns it
-    if [ "$(awk '$1=="pixelformat"{print $2}' "$WORK/state")" = "$fmt" ]; then
-        echo "  ok    pixel format left alone"
-    else
-        echo "  FAIL  the script changed the pixel format"
-        fail=1
-    fi
-
-    # Nothing may be left changed, and nothing may be invented
-    if diff -q <(sort "$WORK/state.before") <(sort "$WORK/state") >/dev/null; then
-        echo "  ok    camera restored exactly"
-    else
-        echo "  FAIL  camera not restored:"
-        diff <(sort "$WORK/state.before") <(sort "$WORK/state") | sed 's/^/        /'
-        fail=1
-    fi
-
-    if grep -q "NOT restoring" "$WORK/out.txt"; then
-        echo "  FAIL  a setting could not be parsed, so it was left alone"
-        fail=1
-    fi
-
-    [ $fail -eq 0 ] || sed 's/^/        /' "$WORK/out.txt"
 done
+
+# Only the media stub may move the format. If the script wrote the register itself the stub's
+# v4l2-ctl would not follow, so this also catches that.
+if grep -q "GAMMA IS\|NO VERDICT" "$WORK/out.txt" \
+   && ! grep -q "could not reconfigure" "$WORK/out.txt"; then
+    echo "  ok    every format reconfigured through the driver"
+else
+    echo "  FAIL  a format could not be reconfigured"
+    fail=1
+fi
+
+if diff -q <(sort "$WORK/state.before") <(sort "$WORK/state") >/dev/null; then
+    echo "  ok    camera restored exactly, pixel format included"
+else
+    echo "  FAIL  camera not restored:"
+    diff <(sort "$WORK/state.before") <(sort "$WORK/state") | sed 's/^/        /'
+    fail=1
+fi
+
+if grep -q "NOT restoring" "$WORK/out.txt"; then
+    echo "  FAIL  a setting could not be parsed, so it was left alone"
+    fail=1
+fi
+
+[ $fail -eq 0 ] || { echo; sed 's/^/    /' "$WORK/out.txt"; }
 
 exit $fail
