@@ -1,28 +1,34 @@
 #!/bin/bash
-# Is the camera's internal gamma stage in the RAW output path?
+# Does the camera's internal gamma stage act on the 12 bit RAW output?
 #
-# probe reports bit 5 of 0xC00 set and the Gamma register (0xC60) holding 0.80 on a camera nobody asked
-# to do that. If that stage acts on the 12 bit data, it composes with whatever curve gstmipimvsrc or the
-# user LUT applies: 0.80 under a 0.50 curve gives a net exponent of 0.40, and photometry drifts about
-# 1 mag across a 4 mag range - silently, because the image still looks right.
+# It matters because if it does, it composes with whatever curve gstmipimvsrc or the user LUT applies:
+# 0.80 under a 0.50 curve is a net 0.40, and photometry then drifts about 1 mag across 4 mag while the
+# image still looks right. Measurement on real star fields says the stage was NOT acting on the nights
+# analysed - linearised aperture sums come out linear at an exponent of 0.51, not 0.40 - but that is an
+# inference from photometry, and this measures the path directly.
 #
-# Measurement on real frames says the stage was NOT acting: linearising the aperture sums of five bright
-# stars comes out linear at an exponent of 0.51, not 0.40. So either the bit was off on those nights and
-# is on now, or it has always been on and is inert in the RAW path. Nothing found so far writes that bit
-# - the kernel driver never touches 0xC00, set_params.sh does not, and both the vendor's dpcenable and
-# this element's read-modify-write preserve it - which points at inert, but points is not knows.
+# WHAT THE FIRST VERSION GOT WRONG, because it is the reason this one is shaped as it is:
 #
-# This settles it the same way the LUT question was settled: change the gamma VALUE by a large factor
-# with the bit left alone, capture before and after, and look at whether RAW12 moved.
+#   It left the enable bit exactly as found, on the assumption the bit was on. With cam-curve in use it
+#   is not: uploading a LUT turns the gamma bit off on purpose, so two curves are not applied in
+#   series. Changing the gamma VALUE while the stage is disabled measures nothing.
 #
-# Run it in DAYLIGHT, on a scene that does not move, with RMS stopped. Nothing here writes flash.
+#   It then wrote a value without checking it took. The camera kept 0.80 when asked for 2.50 - clamped
+#   or refused, there is no documented range - so the two captures were taken under identical
+#   settings.
 #
-# Daylight is not a preference, it is the requirement: the test compares what a given input level
-# becomes, so the frame has to contain a range of mid levels. A night frame at 40 ms and 30 dB is sky
-# background and stars - nothing between - and the comparison would have nothing to measure while
-# still printing a verdict. For the same reason the script sets its own exposure and gain rather than
-# using whatever was left configured: at night settings a daylit scene is saturated end to end, and a
-# curve applied to 4095 returns 4095, which looks exactly like an inert stage.
+#   And it decided from the median absolute difference between two frames, which at gain 0 is sensor
+#   noise. It read 16, called that "live", and printed per level lines showing every level mapping to
+#   itself, i.e. its own data contradicting its verdict. The per level lines are the measurement; the
+#   difference between two frames of a live scene is not.
+#
+# So this version enables the stage, disables the LUT for the duration, finds two gamma values the
+# camera actually accepts, and decides from how the levels moved. Everything is restored on exit,
+# including on Ctrl+C. Nothing is written to flash.
+#
+# Run it in DAYLIGHT, on a scene that does not move, with RMS stopped. Daylight is required, not
+# preferred: the test asks what a given input level becomes, so the frame has to contain a range of mid
+# levels. A night frame at 40 ms and 30 dB is background and stars with nothing in between.
 #
 # Usage: ./test_gamma_path.sh [i2c_bus] [video_node] [width] [height]
 
@@ -42,57 +48,11 @@ i2c() { ./mv_mipi_i2c.sh "$@" -b "$BUS" 2>&1 | grep -v "^Executing:"; }
 grab() {
     v4l2-ctl -d "$VIDEO" --set-fmt-video=width=$W,height=$H \
              --stream-mmap --stream-count=3 --stream-to="$1" >/dev/null 2>&1
-    if [ -s "$1" ]; then
-        ls -l "$1" | awk '{print "    captured", $5, "bytes"}'
-    else
-        echo "    capture FAILED - is $VIDEO right, and is RMS stopped?"
-        return 1
-    fi
+    [ -s "$1" ]
 }
 
-echo "=== state before ==="
-i2c -r -f gammaenable
-i2c -r -f gamma
-i2c -r -f lutenable
-i2c -r -f pixelformat
-
-WAS_EN=$(i2c -r -f gammaenable | grep -oE '[0-9]+$')
-WAS_G=$(i2c -r -f gamma | grep -oE '[0-9]+\.[0-9]+')
-WAS_EXP=$(i2c -r -f metime | grep -oE '[0-9]+' | tail -1)
-WAS_GAIN=$(i2c -r -f mgain | grep -oE '[0-9]+\.[0-9]+' | tail -1)
-echo "(will restore gammaenable=${WAS_EN:-0} gamma=${WAS_G:-1.00} metime=${WAS_EXP:-40000} mgain=${WAS_GAIN:-0.0})"
-
-restore() {
-    echo
-    echo "=== restoring ==="
-    i2c -w -f gamma -p1 "${WAS_G:-1.00}" >/dev/null
-    i2c -w -f gammaenable -p1 "${WAS_EN:-0}" >/dev/null
-    i2c -w -f metime -p1 "${WAS_EXP:-40000}" >/dev/null
-    i2c -w -f mgain -p1 "${WAS_GAIN:-0.0}" >/dev/null
-    i2c -r -f gamma
-    i2c -r -f gammaenable
-    i2c -r -f metime
-    i2c -r -f mgain
-    echo "    nothing was written to flash, so a power cycle also clears this"
-}
-trap restore EXIT INT TERM
-
-# The bit stays exactly as found. Only the value changes, from 0.80 to 2.50 - which is on the other side
-# of 1.0, so if the stage acts at all the frame gets DARKER rather than brighter, and no clipping at the
-# top can hide it. A stage that is enabled but not wired to this data will not move a single pixel.
-# Find an exposure that puts the scene in the middle of the range. Stepping rather than guessing,
-# because how bright a daylit sky is depends on the sky, and a saturated or black frame makes the
-# whole test vacuous. Gain goes to zero: it costs headroom at the top and buys nothing here.
-i2c -w -f mgain -p1 0 >/dev/null
-
-echo
-echo "=== finding a usable exposure (gain 0) ==="
-GOOD_EXP=""
-for EXP in 20 50 100 200 500 1000 2000 5000 10000; do
-    i2c -w -f metime -p1 $EXP >/dev/null
-    sleep 0.4
-    grab "$OUT/probe.raw" >/dev/null 2>&1 || continue
-    MED=$(python3 - "$OUT/probe.raw" "$W" "$H" <<'PY'
+median() {
+    python3 - "$1" "$W" "$H" <<'PY'
 import sys
 import numpy as np
 W, H = int(sys.argv[2]), int(sys.argv[3])
@@ -102,7 +62,76 @@ lo = (d[:, :, 0] << 4) | (d[:, :, 2] >> 4)
 hi = (d[:, :, 1] << 4) | (d[:, :, 2] & 0x0F)
 print(int(np.median(np.stack([lo, hi], 2))))
 PY
-)
+}
+
+# Read a gamma value back as the camera holds it
+read_gamma() { i2c -r -f gamma | grep -oE '[0-9]+\.[0-9]+' | tail -1; }
+
+# Write a gamma and report what stuck. Returns non-zero if the camera did not take it.
+set_gamma() {
+    i2c -w -f gamma -p1 "$1" >/dev/null
+    sleep 0.3
+    local got
+    got=$(read_gamma)
+    [ "$(awk -v a="$got" -v b="$1" 'BEGIN{print (a-b<0.02 && b-a<0.02) ? 1 : 0}')" = "1" ]
+}
+
+echo "=== state before ==="
+i2c -r -f gammaenable
+i2c -r -f gamma
+i2c -r -f lutenable
+i2c -r -f pixelformat
+
+WAS_EN=$(i2c -r -f gammaenable | grep -oE '[0-9]+$')
+WAS_G=$(read_gamma)
+WAS_LUT=$(i2c -r -f lutenable | grep -oE '[0-9]+$')
+WAS_EXP=$(i2c -r -f metime | grep -oE '[0-9]+' | tail -1)
+WAS_GAIN=$(i2c -r -f mgain | grep -oE '[0-9]+\.[0-9]+' | tail -1)
+echo "(will restore gammaenable=${WAS_EN:-0} gamma=${WAS_G:-1.00} lutenable=${WAS_LUT:-0}"
+echo "              metime=${WAS_EXP:-40000} mgain=${WAS_GAIN:-0.0})"
+
+restore() {
+    echo
+    echo "=== restoring ==="
+    i2c -w -f gamma -p1 "${WAS_G:-1.00}" >/dev/null
+    i2c -w -f gammaenable -p1 "${WAS_EN:-0}" >/dev/null
+    i2c -w -f lutenable -p1 "${WAS_LUT:-0}" >/dev/null
+    i2c -w -f metime -p1 "${WAS_EXP:-40000}" >/dev/null
+    i2c -w -f mgain -p1 "${WAS_GAIN:-0.0}" >/dev/null
+    i2c -r -f gamma
+    i2c -r -f gammaenable
+    i2c -r -f lutenable
+    echo "    nothing was written to flash, so a power cycle also clears this"
+}
+trap restore EXIT INT TERM
+
+# The LUT occupies the same tone mapping job. Leaving it on would mean measuring which of the two wins
+# rather than whether gamma reaches the RAW data, so it goes off for the duration.
+echo
+echo "=== preparing: LUT off, gamma stage on ==="
+i2c -w -f lutenable -p1 0 >/dev/null
+i2c -w -f gammaenable -p1 1 >/dev/null
+i2c -r -f lutenable
+i2c -r -f gammaenable
+
+if [ "$(i2c -r -f gammaenable | grep -oE '[0-9]+$')" != "1" ]; then
+    echo
+    echo "    The camera refused to enable the gamma stage, so there is nothing to measure."
+    exit 1
+fi
+
+# Gain to zero: it costs headroom at the top and buys nothing here. Then step the exposure until the
+# scene sits in the middle of the range, because a saturated or black frame makes the test vacuous.
+i2c -w -f mgain -p1 0 >/dev/null
+
+echo
+echo "=== finding a usable exposure (gain 0) ==="
+GOOD_EXP=""
+for EXP in 20 50 100 200 500 1000 2000 5000 10000; do
+    i2c -w -f metime -p1 $EXP >/dev/null
+    sleep 0.4
+    grab "$OUT/probe.raw" || continue
+    MED=$(median "$OUT/probe.raw")
     printf '    %6s us -> median %s\n' "$EXP" "${MED:-?}"
     if [ -n "${MED:-}" ] && [ "$MED" -ge 800 ] && [ "$MED" -le 2500 ]; then
         GOOD_EXP=$EXP
@@ -112,79 +141,109 @@ done
 
 if [ -z "$GOOD_EXP" ]; then
     echo
-    echo "    No exposure put the scene between 800 and 2500 of 4095. Either it is too dark to run"
-    echo "    this now, or the lens is capped. The test needs mid range levels to mean anything, so"
-    echo "    stopping rather than printing a verdict it cannot support."
+    echo "    No exposure put the scene between 800 and 2500 of 4095. Too dark to run this now, or"
+    echo "    the lens is capped. Stopping rather than printing a verdict it cannot support."
+    exit 1
+fi
+echo "    using ${GOOD_EXP} us"
+
+# Two values the camera actually accepts, as far apart as it allows. No documented range, so this is
+# found by trying: the first version assumed 2.50 would be taken and it was not.
+echo
+echo "=== finding two gamma values the camera accepts ==="
+G_LOW=""
+G_HIGH=""
+for G in 0.30 0.40 0.50 0.60 0.70 0.80 0.90 1.00 1.20 1.50 2.00 2.50 3.00; do
+    if set_gamma "$G"; then
+        printf '    %.2f accepted\n' "$G"
+        [ -z "$G_LOW" ] && G_LOW=$G
+        G_HIGH=$G
+    else
+        printf '    %.2f refused (camera kept %s)\n' "$G" "$(read_gamma)"
+    fi
+done
+
+if [ -z "$G_LOW" ] || [ "$G_LOW" = "$G_HIGH" ]; then
+    echo
+    echo "    The camera accepts at most one gamma value, so the curve cannot be varied and this"
+    echo "    test cannot run. Nothing is concluded."
     exit 1
 fi
 
-echo "    using ${GOOD_EXP} us"
+RATIO=$(awk -v a="$G_LOW" -v b="$G_HIGH" 'BEGIN{printf "%.3f", b/a}')
+echo "    using ${G_LOW} and ${G_HIGH} (exponent ratio ${RATIO})"
 
 echo
-echo "=== capture with gamma as found (value ${WAS_G:-?}, enable ${WAS_EN:-?}) ==="
-grab "$OUT/before.raw"
-
-echo
-echo "=== same enable bit, value changed to 2.50 ==="
-i2c -w -f gamma -p1 2.50 >/dev/null
-i2c -r -f gamma
+echo "=== capture at gamma ${G_LOW} ==="
+set_gamma "$G_LOW" || { echo "    could not set it back"; exit 1; }
 sleep 0.5
-grab "$OUT/after.raw"
+grab "$OUT/low.raw" || { echo "    capture FAILED - is $VIDEO right, and is RMS stopped?"; exit 1; }
+echo "    median $(median "$OUT/low.raw")"
+
+echo
+echo "=== capture at gamma ${G_HIGH} ==="
+set_gamma "$G_HIGH" || { echo "    could not set it"; exit 1; }
+sleep 0.5
+grab "$OUT/high.raw" || { echo "    capture FAILED"; exit 1; }
+echo "    median $(median "$OUT/high.raw")"
 
 echo
 echo "=== verdict ==="
-python3 - "$OUT/before.raw" "$OUT/after.raw" "$W" "$H" "${WAS_G:-0.80}" <<'PY'
+python3 - "$OUT/low.raw" "$OUT/high.raw" "$W" "$H" "$G_LOW" "$G_HIGH" <<'PY'
 import sys
 import numpy as np
 
-before, after, W, H, g0 = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), float(sys.argv[5])
+low, high, W, H = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+g_low, g_high = float(sys.argv[5]), float(sys.argv[6])
 
 def frame(path):
-    data = np.fromfile(path, np.uint8)
-    d = data[-(W*3//2*H):].reshape(H, -1)[:, :W*3//2].reshape(H, -1, 3).astype(np.uint16)
+    d = np.fromfile(path, np.uint8)
+    d = d[-(W*3//2*H):].reshape(H, -1)[:, :W*3//2].reshape(H, -1, 3).astype(np.uint16)
     lo = (d[:, :, 0] << 4) | (d[:, :, 2] >> 4)
     hi = (d[:, :, 1] << 4) | (d[:, :, 2] & 0x0F)
     return np.stack([lo, hi], 2).reshape(H, W)
 
-try:
-    a, b = frame(before), frame(after)
-except Exception as e:
-    print("could not unpack:", e); sys.exit(1)
+a, b = frame(low), frame(high)
 
-print("  median before %.0f   after %.0f" % (np.median(a), np.median(b)))
+# A level L seen under g_low came from a linear input x = (L/4095)**(1/g_low), so under g_high it
+# should read 4095*x**g_high = 4095*(L/4095)**(g_high/g_low). An inert stage leaves it at L.
+k = g_high/g_low
+print("  a live stage maps level L to 4095*(L/4095)^%.3f, an inert one leaves it at L\n" % k)
+print("  %8s %10s %10s %10s   %s" % ("level", "measured", "live", "inert", "closer to"))
 
-# If the stage is live, a pixel that read L under exponent g0 should read 4095*(L/4095)**(2.50/g0).
-sampled = 0
-for lvl in (256, 512, 1024, 2048):
+votes_live = votes_inert = 0
+for lvl in (256, 512, 1024, 2048, 3072):
     m = (a > lvl - 8) & (a < lvl + 8)
     if m.sum() < 200:
         continue
-    want = round(4095*(lvl/4095.0)**(2.50/g0))
-    print("  level %4d -> measured %4.0f, a live stage predicts %4d, inert would be %4d"
-          % (lvl, np.median(b[m]), want, lvl))
-    sampled += 1
+    got = float(np.median(b[m]))
+    live = 4095.0*(lvl/4095.0)**k
+    which = "live" if abs(got - live) < abs(got - lvl) else "inert"
+    votes_live += which == "live"
+    votes_inert += which == "inert"
+    print("  %8d %10.0f %10.0f %10d   %s" % (lvl, got, live, lvl, which))
 
-d = float(np.median(np.abs(b.astype(int) - a.astype(int))))
 print()
-if not sampled:
-    print("  NO VERDICT: the frame had no mid range levels to compare, so neither answer is")
-    print("  supported. Point the camera at something with a range of brightness and rerun.")
+if votes_live + votes_inert == 0:
+    print("  NO VERDICT: no mid level had enough pixels to compare. Point the camera at something")
+    print("  with a range of brightness and rerun.")
     sys.exit(1)
-if d < 4:
-    print("  GAMMA IS INERT in the RAW path (median |diff| %.1f)." % d)
-    print("  The bit reading 1 is harmless and the photometry in the report is unaffected.")
-    print("  cam-gamma=0 is then optional - it costs nothing, but it fixes nothing either.")
+
+if votes_live > votes_inert:
+    print("  GAMMA IS LIVE in the RAW path (%d of %d levels moved as the curve predicts)."
+          % (votes_live, votes_live + votes_inert))
+    print("  It therefore composes with any curve set in the element or the LUT, and cam-gamma=0")
+    print("  is required before any night where photometry matters.")
 else:
-    print("  GAMMA IS LIVE in the RAW path (median |diff| %.1f)." % d)
-    print("  Then it composes with any curve set here, and cam-gamma=0 is REQUIRED before")
-    print("  any night that matters. It also means the bit was off during the nights already")
-    print("  analysed, since those measure a net exponent of 0.51 rather than 0.40 - so")
-    print("  something switched it on, and that is worth finding.")
+    print("  GAMMA IS INERT in the RAW path (%d of %d levels did not move)."
+          % (votes_inert, votes_live + votes_inert))
+    print("  The stage does not reach 12 bit data even when enabled, so the enable bit is harmless")
+    print("  here and the photometry in the report is unaffected. This agrees with section 17 of")
+    print("  the IMX178 analysis, which found the stage acting on the 8 bit path only.")
 
 print()
-print("  Caveat: this compares two frames of a live scene. If the light or the scene moved")
-print("  between them, |diff| is large for a reason that has nothing to do with gamma. The")
-print("  per-level lines above are the ones to read - they say WHICH way it moved.")
+print("  Read the per level lines, not any single difference figure: two frames of a live scene")
+print("  differ by sensor noise alone, and at gain 0 that is a median of some 16 ADU.")
 PY
 
 echo
