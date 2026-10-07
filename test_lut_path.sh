@@ -43,8 +43,8 @@ i2c -r -f gammaenable
 i2c -r -f pixelformat
 i2c -r -f blacklevel
 
-WAS_LUT=$(i2c -r -f lutenable | grep -oE '[0-9]+$')
-WAS_FMT=$(i2c -r -f pixelformat | grep -oE '[0-9]+$')
+WAS_LUT=$(i2c -r -f lutenable | grep -oE '[0-9]+' | tail -1)
+WAS_FMT=$(i2c -r -f pixelformat | grep -oE '[0-9]+' | tail -1)
 echo "(will restore lutenable=${WAS_LUT:-0} pixelformat=${WAS_FMT:-2})"
 
 # Phase 1 changes pixelformat behind the driver's back, so make sure an interrupt does not leave it

@@ -82,25 +82,69 @@ i2c -r -f gamma
 i2c -r -f lutenable
 i2c -r -f pixelformat
 
-WAS_EN=$(i2c -r -f gammaenable | grep -oE '[0-9]+$')
+WAS_EN=$(i2c -r -f gammaenable | grep -oE '[0-9]+' | tail -1)
 WAS_G=$(read_gamma)
-WAS_LUT=$(i2c -r -f lutenable | grep -oE '[0-9]+$')
+WAS_LUT=$(i2c -r -f lutenable | grep -oE '[0-9]+' | tail -1)
 WAS_EXP=$(i2c -r -f metime | grep -oE '[0-9]+' | tail -1)
 WAS_GAIN=$(i2c -r -f mgain | grep -oE '[0-9]+\.[0-9]+' | tail -1)
 echo "(will restore gammaenable=${WAS_EN:-0} gamma=${WAS_G:-1.00} lutenable=${WAS_LUT:-0}"
 echo "              metime=${WAS_EXP:-40000} mgain=${WAS_GAIN:-0.0})"
 
+# Writes back only what was actually read. Substituting a default for a value that failed to parse is
+# how the previous version turned the user LUT off: the read said 1, the parse gave nothing, and the
+# default said 0. A setting we cannot name is a setting we must not write.
+put_back() {
+    local what="$1" value="$2"
+
+    if [ -z "$value" ]; then
+        echo "    NOT restoring $what: its original value was never read. Check it by hand."
+        return
+    fi
+
+    i2c -w -f "$what" -p1 "$value" >/dev/null
+    # The ISP enables share one register, so two of these in a row can race - the second read can still
+    # see the value from before the first write, and writing that back undoes it. A pause between them,
+    # and a check afterwards.
+    sleep 0.3
+}
+
+if [ -z "${WAS_EN:-}" ] || [ -z "${WAS_LUT:-}" ] || [ -z "${WAS_G:-}" ]; then
+    echo
+    echo "    Could not read the current gamma/LUT state, so there would be nothing to restore."
+    echo "    Refusing to change anything."
+    exit 1
+fi
+
 restore() {
     echo
     echo "=== restoring ==="
-    i2c -w -f gamma -p1 "${WAS_G:-1.00}" >/dev/null
-    i2c -w -f gammaenable -p1 "${WAS_EN:-0}" >/dev/null
-    i2c -w -f lutenable -p1 "${WAS_LUT:-0}" >/dev/null
-    i2c -w -f metime -p1 "${WAS_EXP:-40000}" >/dev/null
-    i2c -w -f mgain -p1 "${WAS_GAIN:-0.0}" >/dev/null
+    put_back gamma       "${WAS_G:-}"
+    put_back gammaenable "${WAS_EN:-}"
+    put_back lutenable   "${WAS_LUT:-}"
+    put_back metime      "${WAS_EXP:-}"
+    put_back mgain       "${WAS_GAIN:-}"
+
     i2c -r -f gamma
-    i2c -r -f gammaenable
-    i2c -r -f lutenable
+    local en lut
+    en=$(i2c -r -f gammaenable | grep -oE '[0-9]+' | tail -1)
+    lut=$(i2c -r -f lutenable | grep -oE '[0-9]+' | tail -1)
+    echo "r gamma enable is $en"
+    echo "r lut enable is $lut"
+
+    if [ -n "${WAS_EN:-}" ] && [ "$en" != "$WAS_EN" ]; then
+        echo "    WARNING: gammaenable came back as $en, not $WAS_EN. Retrying once..."
+        i2c -w -f gammaenable -p1 "$WAS_EN" >/dev/null
+        sleep 0.3
+        i2c -r -f gammaenable
+    fi
+
+    if [ -n "${WAS_LUT:-}" ] && [ "$lut" != "$WAS_LUT" ]; then
+        echo "    WARNING: lutenable came back as $lut, not $WAS_LUT. Retrying once..."
+        i2c -w -f lutenable -p1 "$WAS_LUT" >/dev/null
+        sleep 0.3
+        i2c -r -f lutenable
+    fi
+
     echo "    nothing was written to flash, so a power cycle also clears this"
 }
 trap restore EXIT INT TERM
@@ -110,11 +154,13 @@ trap restore EXIT INT TERM
 echo
 echo "=== preparing: LUT off, gamma stage on ==="
 i2c -w -f lutenable -p1 0 >/dev/null
+sleep 0.3
 i2c -w -f gammaenable -p1 1 >/dev/null
+sleep 0.3
 i2c -r -f lutenable
 i2c -r -f gammaenable
 
-if [ "$(i2c -r -f gammaenable | grep -oE '[0-9]+$')" != "1" ]; then
+if [ "$(i2c -r -f gammaenable | grep -oE '[0-9]+' | tail -1)" != "1" ]; then
     echo
     echo "    The camera refused to enable the gamma stage, so there is nothing to measure."
     exit 1

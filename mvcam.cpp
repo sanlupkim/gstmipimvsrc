@@ -556,21 +556,41 @@ bool MvCam::save_params()               { return write32(MV_PARAM_SAVE, 1); }
 /* The ISP enables share one register, so flipping a bit means reading the others back first. */
 static bool isp_set_bit(MvCam *cam, int bit, int on)
 {
-    uint32_t v;
-    if (!cam->read32(MV_ISP_MODULE_CTRL, &v))
-        return false;
-    /* A read-modify-write on a bad read is worse than no write at all: all ones ORed with the mask is
-       all ones, and writing that back would switch on every module in the ISP at once - gamma, DPC, the
-       LUT and the white balance - each of which quietly alters pixel values. Refuse instead. */
-    if (!MvCam::implemented(v)) {
-        cam->set_error("ISP control register read as all ones, refusing to write it back");
-        return false;
+    const uint32_t mask = 1u << bit;
+
+    /* Read, write, then read again to confirm - because two of these in a row on the same register
+       race against each other. Clearing gamma and then enabling the LUT, which is exactly what
+       uploading a curve does, gives the second read a chance to still see the value from before the
+       first write; writing that back puts the gamma bit straight back on. A camera reporting internal
+       gamma enabled when nothing asked for it is the symptom, and chasing that cost days.
+       Re-reading on each attempt rather than rewriting the first value, so a bit someone else changed
+       meanwhile is not clobbered. */
+    for (int attempt = 0; attempt < 3; attempt++) {
+
+        uint32_t v;
+        if (!cam->read32(MV_ISP_MODULE_CTRL, &v))
+            return false;
+
+        /* A read-modify-write on a bad read is worse than no write at all: all ones ORed with the mask
+           is all ones, and writing that back would switch on every module in the ISP at once - gamma,
+           DPC, the LUT and the white balance - each of which quietly alters pixel values. */
+        if (!MvCam::implemented(v)) {
+            cam->set_error("ISP control register read as all ones, refusing to write it back");
+            return false;
+        }
+
+        /* Already as wanted - either it was, or the previous attempt's write took */
+        if (((v & mask) != 0) == (on != 0))
+            return true;
+
+        if (!cam->write32(MV_ISP_MODULE_CTRL, on ? (v | mask) : (v & ~mask)))
+            return false;
+
+        usleep(2000);
     }
-    uint32_t mask = 1u << bit;
-    uint32_t nv = on ? (v | mask) : (v & ~mask);
-    if (nv == v)
-        return true;
-    return cam->write32(MV_ISP_MODULE_CTRL, nv);
+
+    cam->set_error("ISP control bit would not stay written");
+    return false;
 }
 
 bool MvCam::lut_count(uint32_t *count)
