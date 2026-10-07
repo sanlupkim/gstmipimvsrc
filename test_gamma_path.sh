@@ -215,7 +215,6 @@ restore() {
     put_back lutenable   "${WAS_LUT:-}"
     put_back metime      "${WAS_EXP:-}"
     put_back mgain       "${WAS_GAIN:-}"
-    put_back pixelformat "${WAS_FMT:-}"
 
     i2c -r -f gamma
     local en lut
@@ -312,23 +311,23 @@ fi
 RATIO=$(awk -v a="$G_LOW" -v b="$G_HIGH" 'BEGIN{printf "%.3f", b/a}')
 echo "    using ${G_LOW} and ${G_HIGH} (exponent ratio ${RATIO})"
 
-# The answer can differ per pixel format, and that is the point: section 17 of the IMX178 analysis
-# measured the stage acting on the 8 bit reduction and not on 10 or 12 bit. Testing whichever format
-# the camera happened to be left in, and reporting on "the RAW path", is what made the first working
-# run misleading. FORMATS can narrow it, e.g. FORMATS=2 for 12 bit only.
-for FMT in ${FORMATS:-2 1 0}; do
+# Only the format the camera is ALREADY in, and the register is not touched. The driver owns the pixel
+# format: it writes Pixel_Format from the media-ctl configuration and sets up the CSI-2 receiver to
+# match. Writing the register behind its back changes what the camera sends without changing what the
+# receiver expects, and the frames come back unusable - median 0, no levels to compare, which is
+# exactly what the previous version reported for RAW12 and RAW10 while claiming to have tested them.
+#
+# To test another format, reconfigure properly first and run this again:
+#
+#     rpi5_scripts/media_setting_rpi5.sh mvcam -fmt RAW12 -x <x> -y <y> -w <w> -h <h> -c 1
+#
+FMT=$WAS_FMT
+NAME=$(case $FMT in 0) echo RAW8;; 1) echo RAW10;; 2) echo RAW12;; *) echo "fmt$FMT";; esac)
 
-    NAME=$(case $FMT in 0) echo RAW8;; 1) echo RAW10;; 2) echo RAW12;; *) echo "fmt$FMT";; esac)
+for once in 1; do
 
     echo
-    echo "================= $NAME ================="
-    i2c -w -f pixelformat -p1 "$FMT" >/dev/null
-    sleep 0.6
-
-    if [ "$(i2c -r -f pixelformat | grep -oE '[0-9]+' | tail -1)" != "$FMT" ]; then
-        echo "    the camera did not take this format, skipping"
-        continue
-    fi
+    echo "================= $NAME (as the driver has it) ================="
 
     set_gamma "$G_LOW" || { echo "    could not set gamma $G_LOW"; continue; }
     sleep 0.5
@@ -341,8 +340,14 @@ for FMT in ${FORMATS:-2 1 0}; do
     echo "    gamma $G_HIGH median $(median "$OUT/high_$FMT.raw" "$FMT")"
 
     echo
-    python3 "$OUT/analyse.py" "$OUT/low_$FMT.raw" "$OUT/high_$FMT.raw" \
-            "$W" "$H" "$FMT" "$NAME" "$G_LOW" "$G_HIGH"
+    if ! python3 "$OUT/analyse.py" "$OUT/low_$FMT.raw" "$OUT/high_$FMT.raw" \
+                 "$W" "$H" "$FMT" "$NAME" "$G_LOW" "$G_HIGH"; then
+        echo
+        echo "    Nothing to compare usually means the frames are not in the format assumed here."
+        echo "    Check that media_setting_rpi5.sh configured $NAME, and that nothing has written the"
+        echo "    Pixel_Format register since: the driver sets up the CSI-2 receiver from its own"
+        echo "    configuration, so the two disagreeing gives frames that unpack to nothing."
+    fi
 done
 
 echo

@@ -7,8 +7,12 @@
 # ladder of question marks. Every one of those would have shown up in ten seconds here.
 #
 # The stub applies gamma only when reducing to 8 bits, which is what section 17 of the IMX178 analysis
-# measured on real sunset frames. So the expected result is RAW12 inert, RAW10 inert, RAW8 live, and
-# the camera left exactly as it was found.
+# measured on real sunset frames. So the expected result is live in RAW8 and inert in RAW10 and RAW12.
+#
+# Each format is a separate run with the stub set to it, because that is how it works on the camera: the
+# driver owns the pixel format and the test may not change it. One run tests the one format the camera
+# is in. The previous version of both files ran a loop writing the register, which changed what the
+# camera sent without changing what the CSI receiver expected, and got frames that unpacked to nothing.
 #
 # Usage: tests/run_test_gamma_path.sh
 
@@ -23,57 +27,61 @@ mkdir -p "$WORK/bin"
 cp "$HERE/bin/v4l2-ctl" "$WORK/bin/v4l2-ctl"
 chmod +x "$WORK/mv_mipi_i2c.sh" "$WORK/bin/v4l2-ctl"
 
-cat > "$WORK/state" <<'EOF'
+fail=0
+
+for case in "0 RAW8 LIVE" "1 RAW10 INERT" "2 RAW12 INERT"; do
+
+    set -- $case
+    fmt=$1 name=$2 want=$3
+
+    cat > "$WORK/state" <<EOF
 gammaenable 0
 gamma 0.80
 lutenable 1
-pixelformat 0
+pixelformat $fmt
 metime 39906
 mgain 30.0
 EOF
-cp "$WORK/state" "$WORK/state.before"
+    cp "$WORK/state" "$WORK/state.before"
 
-LC_ALL=C PATH="$WORK/bin:$PATH" MV_TOOLS="$WORK" \
-    bash "$HERE/../test_gamma_path.sh" 4 /dev/video8 240 206 > "$WORK/out.txt" 2>&1
-rc=$?
+    LC_ALL=C PATH="$WORK/bin:$PATH" MV_TOOLS="$WORK" \
+        bash "$HERE/../test_gamma_path.sh" 4 /dev/video8 240 206 > "$WORK/out.txt" 2>&1
+    rc=$?
 
-fail=0
-check() {
-    if grep -qF "$1" "$WORK/out.txt"; then
-        echo "  ok    $1"
+    echo "--- camera configured for $name (exit $rc) ---"
+    [ $rc -eq 0 ] || { echo "  FAIL  non zero exit"; fail=1; }
+
+    if grep -qF "$name: GAMMA IS $want" "$WORK/out.txt"; then
+        echo "  ok    $name: GAMMA IS $want"
     else
-        echo "  FAIL  expected: $1"
+        echo "  FAIL  expected $name: GAMMA IS $want"
+        grep -E "GAMMA IS|NO VERDICT" "$WORK/out.txt" | sed 's/^/        got: /'
         fail=1
     fi
-}
 
-echo "exit code $rc"
-[ $rc -eq 0 ] || fail=1
+    # The format may not be touched: the driver owns it
+    if [ "$(awk '$1=="pixelformat"{print $2}' "$WORK/state")" = "$fmt" ]; then
+        echo "  ok    pixel format left alone"
+    else
+        echo "  FAIL  the script changed the pixel format"
+        fail=1
+    fi
 
-check "RAW12: GAMMA IS INERT"
-check "RAW10: GAMMA IS INERT"
-check "RAW8: GAMMA IS LIVE"
+    # Nothing may be left changed, and nothing may be invented
+    if diff -q <(sort "$WORK/state.before") <(sort "$WORK/state") >/dev/null; then
+        echo "  ok    camera restored exactly"
+    else
+        echo "  FAIL  camera not restored:"
+        diff <(sort "$WORK/state.before") <(sort "$WORK/state") | sed 's/^/        /'
+        fail=1
+    fi
 
-# Nothing may be left changed, and nothing may be invented: the restore has to be exact
-if diff -q <(sort "$WORK/state.before") <(sort "$WORK/state") >/dev/null; then
-    echo "  ok    camera restored exactly"
-else
-    echo "  FAIL  camera not restored:"
-    diff <(sort "$WORK/state.before") <(sort "$WORK/state") | sed 's/^/        /'
-    fail=1
-fi
+    if grep -q "NOT restoring" "$WORK/out.txt"; then
+        echo "  FAIL  a setting could not be parsed, so it was left alone"
+        fail=1
+    fi
 
-if grep -q "NOT restoring" "$WORK/out.txt"; then
-    echo "  FAIL  a setting could not be parsed, so it was left alone"
-    fail=1
-else
-    echo "  ok    every setting was read back and restored"
-fi
-
-if [ $fail -ne 0 ]; then
-    echo
-    echo "full output:"
-    sed 's/^/    /' "$WORK/out.txt"
-fi
+    [ $fail -eq 0 ] || sed 's/^/        /' "$WORK/out.txt"
+done
 
 exit $fail
