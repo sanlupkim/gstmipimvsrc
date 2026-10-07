@@ -51,17 +51,33 @@ grab() {
     [ -s "$1" ]
 }
 
-median() {
-    python3 - "$1" "$W" "$H" <<'PY'
+# Unpacking depends on the pixel format, and getting that wrong is how the first working run of this
+# test drew a conclusion about "the RAW path" from a RAW8 frame read as packed 12 bit. The byte count
+# does not disambiguate on its own: three RAW8 frames and two Y12P frames are the same size.
+unpack_py() {
+    cat <<'PY'
 import sys
 import numpy as np
-W, H = int(sys.argv[2]), int(sys.argv[3])
-d = np.fromfile(sys.argv[1], np.uint8)
-d = d[-(W*3//2*H):].reshape(H, -1)[:, :W*3//2].reshape(H, -1, 3).astype(np.uint16)
-lo = (d[:, :, 0] << 4) | (d[:, :, 2] >> 4)
-hi = (d[:, :, 1] << 4) | (d[:, :, 2] & 0x0F)
-print(int(np.median(np.stack([lo, hi], 2))))
+
+path, W, H, fmt = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+d = np.fromfile(path, np.uint8)
+
+if fmt == 0:                                  # RAW8, one byte per pixel, scaled to 12 bit terms
+    f = d[-(W*H):].reshape(H, W).astype(np.uint16)*16
+elif fmt == 1:                                # Y10P, 5 bytes per 4 pixels
+    b = d[-(W*5//4*H):].reshape(H, -1)[:, :W*5//4].reshape(H, -1, 5).astype(np.uint16)
+    p = [((b[:, :, i] << 2) | ((b[:, :, 4] >> (6 - 2*i)) & 0x03)) << 2 for i in range(4)]
+    f = np.stack(p, 2).reshape(H, W)
+else:                                         # Y12P, 3 bytes per 2 pixels
+    b = d[-(W*3//2*H):].reshape(H, -1)[:, :W*3//2].reshape(H, -1, 3).astype(np.uint16)
+    lo = (b[:, :, 0] << 4) | (b[:, :, 2] >> 4)
+    hi = (b[:, :, 1] << 4) | (b[:, :, 2] & 0x0F)
+    f = np.stack([lo, hi], 2).reshape(H, W)
 PY
+}
+
+median() {
+    { unpack_py; echo 'print(int(np.median(f)))'; } | python3 - "$1" "$W" "$H" "$2"
 }
 
 # Read a gamma value back as the camera holds it
@@ -76,6 +92,76 @@ set_gamma() {
     [ "$(awk -v a="$got" -v b="$1" 'BEGIN{print (a-b<0.02 && b-a<0.02) ? 1 : 0}')" = "1" ]
 }
 
+# The analysis goes in its own file rather than a heredoc, so the format loop below can call it per
+# format without the quoting getting out of hand.
+cat > "$OUT/analyse.py" <<'PY'
+import sys
+
+import numpy as np
+
+low, high, W, H, fmt = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+name, g_low, g_high = sys.argv[6], float(sys.argv[7]), float(sys.argv[8])
+
+
+def frame(path):
+    """ Unpack according to the pixel format, scaled to 12 bit terms so one set of levels fits all.
+
+        Getting this wrong is how the first working run drew a conclusion about "the RAW path" from a
+        RAW8 frame read as packed 12 bit. The byte count does not disambiguate: three RAW8 frames and
+        two Y12P frames of this size are the same number of bytes.
+    """
+    d = np.fromfile(path, np.uint8)
+
+    if fmt == 0:
+        return d[-(W*H):].reshape(H, W).astype(np.uint16)*16
+
+    if fmt == 1:
+        b = d[-(W*5//4*H):].reshape(H, -1)[:, :W*5//4].reshape(H, -1, 5).astype(np.uint16)
+        p = [((b[:, :, i] << 2) | ((b[:, :, 4] >> (6 - 2*i)) & 0x03)) << 2 for i in range(4)]
+        return np.stack(p, 2).reshape(H, W)
+
+    b = d[-(W*3//2*H):].reshape(H, -1)[:, :W*3//2].reshape(H, -1, 3).astype(np.uint16)
+    lo = (b[:, :, 0] << 4) | (b[:, :, 2] >> 4)
+    hi = (b[:, :, 1] << 4) | (b[:, :, 2] & 0x0F)
+    return np.stack([lo, hi], 2).reshape(H, W)
+
+
+a, b = frame(low), frame(high)
+k = g_high/g_low
+
+print("  %s: a live stage maps level L to 4095*(L/4095)^%.3f, an inert one leaves it at L"
+      % (name, k))
+print("  %8s %10s %10s %10s   %s" % ("level", "measured", "live", "inert", "closer to"))
+
+votes_live = votes_inert = 0
+
+for lvl in (256, 512, 1024, 2048, 3072):
+    m = (a > lvl - 8) & (a < lvl + 8)
+
+    if m.sum() < 200:
+        continue
+
+    got = float(np.median(b[m]))
+    live = 4095.0*(lvl/4095.0)**k
+    which = "live" if abs(got - live) < abs(got - lvl) else "inert"
+    votes_live += which == "live"
+    votes_inert += which == "inert"
+    print("  %8d %10.0f %10.0f %10d   %s" % (lvl, got, live, lvl, which))
+
+print()
+
+if votes_live + votes_inert == 0:
+    print("  %s: NO VERDICT - no mid level had enough pixels to compare." % name)
+    sys.exit(2)
+
+if votes_live > votes_inert:
+    print("  %s: GAMMA IS LIVE (%d of %d levels moved as the curve predicts)."
+          % (name, votes_live, votes_live + votes_inert))
+else:
+    print("  %s: GAMMA IS INERT (%d of %d levels did not move)."
+          % (name, votes_inert, votes_live + votes_inert))
+PY
+
 echo "=== state before ==="
 i2c -r -f gammaenable
 i2c -r -f gamma
@@ -87,6 +173,7 @@ WAS_G=$(read_gamma)
 WAS_LUT=$(i2c -r -f lutenable | grep -oE '[0-9]+' | tail -1)
 WAS_EXP=$(i2c -r -f metime | grep -oE '[0-9]+' | tail -1)
 WAS_GAIN=$(i2c -r -f mgain | grep -oE '[0-9]+\.[0-9]+' | tail -1)
+WAS_FMT=$(i2c -r -f pixelformat | grep -oE '[0-9]+' | tail -1)
 echo "(will restore gammaenable=${WAS_EN:-0} gamma=${WAS_G:-1.00} lutenable=${WAS_LUT:-0}"
 echo "              metime=${WAS_EXP:-40000} mgain=${WAS_GAIN:-0.0})"
 
@@ -123,6 +210,7 @@ restore() {
     put_back lutenable   "${WAS_LUT:-}"
     put_back metime      "${WAS_EXP:-}"
     put_back mgain       "${WAS_GAIN:-}"
+    put_back pixelformat "${WAS_FMT:-}"
 
     i2c -r -f gamma
     local en lut
@@ -219,78 +307,53 @@ fi
 RATIO=$(awk -v a="$G_LOW" -v b="$G_HIGH" 'BEGIN{printf "%.3f", b/a}')
 echo "    using ${G_LOW} and ${G_HIGH} (exponent ratio ${RATIO})"
 
-echo
-echo "=== capture at gamma ${G_LOW} ==="
-set_gamma "$G_LOW" || { echo "    could not set it back"; exit 1; }
-sleep 0.5
-grab "$OUT/low.raw" || { echo "    capture FAILED - is $VIDEO right, and is RMS stopped?"; exit 1; }
-echo "    median $(median "$OUT/low.raw")"
+# The answer can differ per pixel format, and that is the point: section 17 of the IMX178 analysis
+# measured the stage acting on the 8 bit reduction and not on 10 or 12 bit. Testing whichever format
+# the camera happened to be left in, and reporting on "the RAW path", is what made the first working
+# run misleading. FORMATS can narrow it, e.g. FORMATS=2 for 12 bit only.
+for FMT in ${FORMATS:-2 1 0}; do
 
-echo
-echo "=== capture at gamma ${G_HIGH} ==="
-set_gamma "$G_HIGH" || { echo "    could not set it"; exit 1; }
-sleep 0.5
-grab "$OUT/high.raw" || { echo "    capture FAILED"; exit 1; }
-echo "    median $(median "$OUT/high.raw")"
+    NAME=$(case $FMT in 0) echo RAW8;; 1) echo RAW10;; 2) echo RAW12;; *) echo "fmt$FMT";; esac)
 
-echo
-echo "=== verdict ==="
-python3 - "$OUT/low.raw" "$OUT/high.raw" "$W" "$H" "$G_LOW" "$G_HIGH" <<'PY'
-import sys
-import numpy as np
+    echo
+    echo "================= $NAME ================="
+    i2c -w -f pixelformat -p1 "$FMT" >/dev/null
+    sleep 0.6
 
-low, high, W, H = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-g_low, g_high = float(sys.argv[5]), float(sys.argv[6])
-
-def frame(path):
-    d = np.fromfile(path, np.uint8)
-    d = d[-(W*3//2*H):].reshape(H, -1)[:, :W*3//2].reshape(H, -1, 3).astype(np.uint16)
-    lo = (d[:, :, 0] << 4) | (d[:, :, 2] >> 4)
-    hi = (d[:, :, 1] << 4) | (d[:, :, 2] & 0x0F)
-    return np.stack([lo, hi], 2).reshape(H, W)
-
-a, b = frame(low), frame(high)
-
-# A level L seen under g_low came from a linear input x = (L/4095)**(1/g_low), so under g_high it
-# should read 4095*x**g_high = 4095*(L/4095)**(g_high/g_low). An inert stage leaves it at L.
-k = g_high/g_low
-print("  a live stage maps level L to 4095*(L/4095)^%.3f, an inert one leaves it at L\n" % k)
-print("  %8s %10s %10s %10s   %s" % ("level", "measured", "live", "inert", "closer to"))
-
-votes_live = votes_inert = 0
-for lvl in (256, 512, 1024, 2048, 3072):
-    m = (a > lvl - 8) & (a < lvl + 8)
-    if m.sum() < 200:
+    if [ "$(i2c -r -f pixelformat | grep -oE '[0-9]+' | tail -1)" != "$FMT" ]; then
+        echo "    the camera did not take this format, skipping"
         continue
-    got = float(np.median(b[m]))
-    live = 4095.0*(lvl/4095.0)**k
-    which = "live" if abs(got - live) < abs(got - lvl) else "inert"
-    votes_live += which == "live"
-    votes_inert += which == "inert"
-    print("  %8d %10.0f %10.0f %10d   %s" % (lvl, got, live, lvl, which))
+    fi
 
-print()
-if votes_live + votes_inert == 0:
-    print("  NO VERDICT: no mid level had enough pixels to compare. Point the camera at something")
-    print("  with a range of brightness and rerun.")
-    sys.exit(1)
+    set_gamma "$G_LOW" || { echo "    could not set gamma $G_LOW"; continue; }
+    sleep 0.5
+    grab "$OUT/low_$FMT.raw" || { echo "    capture FAILED - is $VIDEO right, and is RMS stopped?"; continue; }
+    echo "    gamma $G_LOW  median $(median "$OUT/low_$FMT.raw" "$FMT")"
 
-if votes_live > votes_inert:
-    print("  GAMMA IS LIVE in the RAW path (%d of %d levels moved as the curve predicts)."
-          % (votes_live, votes_live + votes_inert))
-    print("  It therefore composes with any curve set in the element or the LUT, and cam-gamma=0")
-    print("  is required before any night where photometry matters.")
-else:
-    print("  GAMMA IS INERT in the RAW path (%d of %d levels did not move)."
-          % (votes_inert, votes_live + votes_inert))
-    print("  The stage does not reach 12 bit data even when enabled, so the enable bit is harmless")
-    print("  here and the photometry in the report is unaffected. This agrees with section 17 of")
-    print("  the IMX178 analysis, which found the stage acting on the 8 bit path only.")
+    set_gamma "$G_HIGH" || { echo "    could not set gamma $G_HIGH"; continue; }
+    sleep 0.5
+    grab "$OUT/high_$FMT.raw" || { echo "    capture FAILED"; continue; }
+    echo "    gamma $G_HIGH median $(median "$OUT/high_$FMT.raw" "$FMT")"
 
-print()
-print("  Read the per level lines, not any single difference figure: two frames of a live scene")
-print("  differ by sensor noise alone, and at gain 0 that is a median of some 16 ADU.")
-PY
+    echo
+    python3 "$OUT/analyse.py" "$OUT/low_$FMT.raw" "$OUT/high_$FMT.raw" \
+            "$W" "$H" "$FMT" "$NAME" "$G_LOW" "$G_HIGH"
+done
 
 echo
+echo "=== what this means ==="
+cat <<'EOT'
+  A format where the stage is LIVE composes its gamma with any curve the element or the LUT applies.
+  There, cam-gamma=0 is required before a night where photometry matters - the net exponent is the
+  product of the two, and RMS has one gamma field in the platepar, so it cannot undo a product.
+
+  A format where it is INERT can leave the enable bit alone: it changes nothing.
+
+  This is expected to split by format rather than answer yes or no. Section 17 of the IMX178 analysis
+  measured the stage acting on the 8 bit reduction - exponent 0.820, and a pedestal of 21.8 levels
+  where plain truncation would give 12.4 - and not on 10 or 12 bit, where the measurement is a clean
+  truncation and the star photometry comes out linear at the curve the element applied. If this run
+  agrees, that is two independent methods on the same conclusion.
+EOT
+
 echo "    captures left in $OUT"
