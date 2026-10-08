@@ -746,7 +746,8 @@ static void mv_apply_live(GstMipiMvSrc *src, guint prop_id)
             if (src->cam_gamma >= 0.0) {
                 double got = 0;
                 /* A gamma of 0 is how you ask for the curve to be bypassed. */
-                src->i2c->set_gamma_enable(src->cam_gamma > 0.0 ? 1 : 0);
+                if (!src->i2c->set_gamma_enable(src->cam_gamma > 0.0 ? 1 : 0))
+                    GST_WARNING("camera: gamma enable failed: %s", src->i2c->error().c_str());
                 if (src->cam_gamma > 0.0 && src->i2c->set_gamma(src->cam_gamma, &got))
                     GST_INFO("camera: gamma %.2f -> %.2f", src->cam_gamma, got);
             }
@@ -830,8 +831,11 @@ static void mv_apply_live(GstMipiMvSrc *src, guint prop_id)
             break;
         case PROP_CAM_LUT:
             if (src->cam_lut >= 0) {
-                src->i2c->set_lut_enable(src->cam_lut);
-                GST_INFO("camera: user LUT %s", src->cam_lut ? "on" : "off");
+                if (src->i2c->set_lut_enable(src->cam_lut))
+                    GST_INFO("camera: user LUT %s", src->cam_lut ? "on" : "off");
+                else
+                    GST_WARNING("camera: user LUT %s failed: %s", src->cam_lut ? "on" : "off",
+                                src->i2c->error().c_str());
             }
             break;
         case PROP_CAM_BLC:
@@ -1062,9 +1066,43 @@ static gboolean mv_upload_curve(GstMipiMvSrc *src, float B, float D, float SP)
     }
 
     /* Two curves in series would be applied twice, so make sure the camera's own gamma is out of the
-       way, then switch the table on. */
-    src->i2c->set_gamma_enable(0);
-    src->i2c->set_lut_enable(1);
+       way, then switch the table on. Both results are checked, and a failure stops the start rather
+       than streaming anyway: this went wrong on the night of 7/8 Oct 2026 and nothing said so. The
+       gamma stayed on underneath the uploaded table, which lifts the sensor's black level instead of
+       the signal - the pedestal at 197 came out of the gamma stage at 340, the table still subtracted
+       196, and the whole frame sat at a flat 49 ADU, masked corners included, with the sky's 1 ADU of
+       modulation crushed to 0.16. The pictures look washed out rather than broken, so three and a
+       half hours went by before a pipeline rebuild happened to put it right. */
+    if (!src->i2c->set_gamma_enable(0)) {
+        GST_ERROR("camera: could not turn the camera's own gamma off: %s. Not enabling the uploaded "
+                  "curve - two curves in series stretch the black level and the frames look merely "
+                  "pale, not wrong.", src->i2c->error().c_str());
+        return FALSE;
+    }
+
+    if (!src->i2c->set_lut_enable(1)) {
+        GST_ERROR("camera: the curve uploaded but could not be switched on: %s",
+                  src->i2c->error().c_str());
+        return FALSE;
+    }
+
+    /* Read both bits back and say what they are. A start that went well then proves it in the log,
+       instead of leaving it to be worked out afterwards from the pixel values. */
+    uint32_t isp = 0;
+    if (src->i2c->read32(MV_ISP_MODULE_CTRL, &isp) && MvCam::implemented(isp)) {
+
+        const gboolean gamma_on = (isp & (1u << MV_ISP_BIT_GAMMA)) != 0;
+        const gboolean lut_on = (isp & (1u << MV_ISP_BIT_LUT)) != 0;
+
+        if (gamma_on || !lut_on) {
+            GST_ERROR("camera: after enabling the curve the ISP says gamma %s, LUT %s - that is not "
+                      "what was asked for and the frames would be wrong",
+                      gamma_on ? "on" : "off", lut_on ? "on" : "off");
+            return FALSE;
+        }
+
+        GST_INFO("camera: ISP control register 0x%08x: gamma off, LUT on", (unsigned)isp);
+    }
 
     /* The measured time, not the estimate, because this is the largest single thing a start() does
        and anything that reads an absolute timestamp downstream has to account for it. */
@@ -1237,9 +1275,17 @@ static gboolean mv_setup_camera(GstMipiMvSrc *src)
     mv_apply_live(src, PROP_CAM_BLC);
 
     /* After the other controls: uploading the curve turns the camera's own gamma off, so it must not be
-       re-enabled afterwards by cam-gamma. */
-    if (src->cam_curve)
-        mv_upload_curve(src, src->ghs_b, src->ghs_d, src->ghs_sp);
+       re-enabled afterwards by cam-gamma.
+
+       A failure here stops the start. The fallback - the host curve - is not a fallback at all when
+       cam-curve was asked for: black-level is then a code in the camera's 12 bit domain, and the host
+       table indexes 8 bit values, so it would map the whole frame to black. Better a pipeline that
+       refuses to start, which is loud, than a night of pictures that are quietly out by a gamma. */
+    if (src->cam_curve && !mv_upload_curve(src, src->ghs_b, src->ghs_d, src->ghs_sp)) {
+        GST_ERROR("camera: cam-curve was asked for and the curve is not in the camera, refusing to "
+                  "stream");
+        return FALSE;
+    }
 
     src->fc_valid = src->i2c->frame_counts(&src->fc_sensor0, &src->fc_out0);
 

@@ -565,6 +565,8 @@ static bool isp_set_bit(MvCam *cam, int bit, int on)
        gamma enabled when nothing asked for it is the symptom, and chasing that cost days.
        Re-reading on each attempt rather than rewriting the first value, so a bit someone else changed
        meanwhile is not clobbered. */
+    bool bad_read = false;
+
     for (int attempt = 0; attempt < 3; attempt++) {
 
         uint32_t v;
@@ -573,11 +575,18 @@ static bool isp_set_bit(MvCam *cam, int bit, int on)
 
         /* A read-modify-write on a bad read is worse than no write at all: all ones ORed with the mask
            is all ones, and writing that back would switch on every module in the ISP at once - gamma,
-           DPC, the LUT and the white balance - each of which quietly alters pixel values. */
+           DPC, the LUT and the white balance - each of which quietly alters pixel values.
+
+           Refuse this attempt, but ask again rather than give up: the bad read is the transient part,
+           and the loop exists precisely because this register does not always answer. Returning here
+           turned one bad answer into a whole night with the gamma bit left exactly as it was. */
         if (!MvCam::implemented(v)) {
-            cam->set_error("ISP control register read as all ones, refusing to write it back");
-            return false;
+            bad_read = true;
+            usleep(2000);
+            continue;
         }
+
+        bad_read = false;
 
         /* Already as wanted - either it was, or the previous attempt's write took */
         if (((v & mask) != 0) == (on != 0))
@@ -589,7 +598,8 @@ static bool isp_set_bit(MvCam *cam, int bit, int on)
         usleep(2000);
     }
 
-    cam->set_error("ISP control bit would not stay written");
+    cam->set_error(bad_read ? "ISP control register read as all ones, refusing to write it back"
+                            : "ISP control bit would not stay written");
     return false;
 }
 
